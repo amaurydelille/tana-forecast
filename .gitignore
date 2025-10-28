@@ -1,0 +1,9 @@
+**/datasets
+__pycache__
+*.pyc
+*.pyo
+*.egg-info
+.ipynb_checkpoints
+checkpoints/
+*.pt
+*.pth

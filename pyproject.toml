@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=45", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tana-forecast"
+version = "0.1.0"
+description = "Time series forecasting with transformers"
+requires-python = ">=3.8"
+dependencies = [
+    "torch>=2.0.0",
+    "pandas>=2.0.0",
+    "numpy>=1.24.0",
+    "plotly>=5.0.0",
+    "nbformat>=4.2.0",
+    "ipywidgets>=7.6.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["src*"]
+

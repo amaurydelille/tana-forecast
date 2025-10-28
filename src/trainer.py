@@ -102,7 +102,7 @@ class TanaForecastTrainer:
         num_epochs: int = 100,
         device: str = "cuda" if torch.cuda.is_available() else "cpu",
         checkpoint_dir: Optional[str] = None,
-        early_stopping_patience: int = 10
+        early_stopping_patience: int = -1
     ) -> None:
         self.model = model.to(device)
         self.device = device
@@ -163,6 +163,9 @@ class TanaForecastTrainer:
             context = context.to(self.device)
             target = target.to(self.device)
             
+            if target.dim() == 3 and target.size(1) == 1:
+                target = target.squeeze(1)
+            
             self.optimizer.zero_grad()
             
             predictions = self.model(context)
@@ -190,6 +193,9 @@ class TanaForecastTrainer:
             for context, target in self.val_loader:
                 context = context.to(self.device)
                 target = target.to(self.device)
+                
+                if target.dim() == 3 and target.size(1) == 1:
+                    target = target.squeeze(1)
                 
                 predictions = self.model(context)
                 loss = self.criterion(predictions, target)
@@ -265,7 +271,7 @@ class TanaForecastTrainer:
             else:
                 self.epochs_without_improvement += 1
             
-            if self.epochs_without_improvement >= self.early_stopping_patience:
+            if self.early_stopping_patience != -1 and self.epochs_without_improvement >= self.early_stopping_patience:
                 print(f"\nEarly stopping triggered after {epoch+1} epochs")
                 break
             

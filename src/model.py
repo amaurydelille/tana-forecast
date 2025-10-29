@@ -2,12 +2,24 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
+from typing import List
 
 PATCH_SIZE = 24
 STRIDE = 12
 D_OUT = 64
 N_EXPERT = 8
 TOP_K = 4
+
+class Monitor:
+    def __init__(self) -> None:
+        self.expert_counts = [0] * N_EXPERT
+
+    def update_expert_counts(self, expert_ids: torch.Tensor) -> None:
+        for expert_id in expert_ids.unique():
+            self.expert_counts[expert_id.item()] += 1
+
+    def get_expert_counts(self) -> List[int]:
+        return self.expert_counts
 
 class Patch(nn.Module):
     """
@@ -95,7 +107,9 @@ class MixtureOfExpert(nn.Module):
         n_experts: int, 
         top_k: int,
         bias: bool = False,
-        dropout: float = 0.2
+        dropout: float = 0.2,
+        monitor: Monitor = None,
+        return_router_info: bool = False
     ) -> None:
         super().__init__()
         assert n_experts > top_k, "Number of experts must be strictly greater than top_k."
@@ -107,8 +121,10 @@ class MixtureOfExpert(nn.Module):
         self.experts = nn.ModuleList([nn.Linear(d_model, d_model) for _ in range(n_experts)])
         self.router = nn.Linear(d_model, n_experts)
         self.out = nn.Linear(d_model, d_model)
-
-    def forward(self, X: torch.Tensor) -> torch.Tensor:
+        self.monitor = monitor
+        self.return_router_info = return_router_info
+        
+    def forward(self, X: torch.Tensor):
         router_logits = self.router(X)
         router_weights = F.softmax(router_logits, dim=-1)
         top_k_weights, top_k_indices = router_weights.topk(k=self.top_k, dim=-1)
@@ -117,6 +133,7 @@ class MixtureOfExpert(nn.Module):
         for i in range(self.top_k):
             expert_idx = top_k_indices[:, :, i]
             expert_weight = top_k_weights[:, :, i].unsqueeze(-1)
+            self.monitor.update_expert_counts(expert_idx) if self.monitor is not None else None
 
             for expert_id in range(self.n_experts):
                 mask = (expert_idx == expert_id)
@@ -125,18 +142,26 @@ class MixtureOfExpert(nn.Module):
                     mask_expanded = mask.unsqueeze(-1)
                     output += expert_weight * expert_output * mask_expanded.float()
 
-        return self.out(output)
+        output = self.out(output)
+        
+        if self.return_router_info:
+            return output, router_weights, top_k_indices
+        return output
 
 class Decoder(nn.Module):
     def __init__(self, 
         context_window: int,
         prediction_length: int,
-        d_model: int = 64
+        d_model: int = 64,
+        monitor: Monitor = None,
+        return_router_info: bool = False
     ) -> None:
         super().__init__()
         self.context_window = context_window
         self.prediction_length = prediction_length
         self.d_model = d_model
+        self.monitor = monitor
+        self.return_router_info = return_router_info
         
         self.patch = Patch(
             X=torch.zeros(1, d_model, context_window),
@@ -148,7 +173,7 @@ class Decoder(nn.Module):
         self.layer_norm_1 = nn.LayerNorm(D_OUT)
         self.attention = CausalSelfAttention(d_model=D_OUT)
         self.layer_norm_2 = nn.LayerNorm(D_OUT)
-        self.moe = MixtureOfExpert(d_model=D_OUT, n_experts=N_EXPERT, top_k=TOP_K)
+        self.moe = MixtureOfExpert(d_model=D_OUT, n_experts=N_EXPERT, top_k=TOP_K, monitor=self.monitor, return_router_info=return_router_info)
         self.out = nn.Linear(in_features=D_OUT, out_features=prediction_length)
 
     def project_channels(self, X: torch.Tensor) -> torch.Tensor:
@@ -163,26 +188,54 @@ class Decoder(nn.Module):
             pooled = F.adaptive_avg_pool1d(X.transpose(1, 2), self.d_model).transpose(1, 2)
             return pooled
 
-    def forward(self, X: torch.Tensor) -> torch.Tensor:
+    def forward(self, X: torch.Tensor):
         X = self.project_channels(X)
         
         X = self.patch(X)
         X = self.layer_norm_1(X)
         X = self.attention(X)
-        X = self.moe(X)
+        
+        if self.return_router_info:
+            X, router_probs, expert_indices = self.moe(X)
+        else:
+            X = self.moe(X)
+            
         X = self.layer_norm_2(X)
         X = X[:, -1, :]
-        return self.out(X)
+        output = self.out(X)
+        
+        if self.return_router_info:
+            return output, router_probs, expert_indices
+        return output
 
 class TanaForecast(nn.Module):
-    def __init__(self, context_window: int, prediction_length: int) -> None:
+    def __init__(self, context_window: int, prediction_length: int, return_router_info: bool = False) -> None:
         super().__init__()
+
+        # to monitor router activation
+        self.monitor = Monitor()
+
         self.context_window = context_window
         self.prediction_length = prediction_length
-        self.decoder = Decoder(context_window=context_window, prediction_length=prediction_length)
+        self.return_router_info = return_router_info
+        self.decoder = Decoder(
+            context_window=context_window, 
+            prediction_length=prediction_length,
+            monitor=self.monitor,
+            return_router_info=return_router_info
+        )
 
-    def forward(self, X: torch.Tensor) -> torch.Tensor:
+    def forward(self, X: torch.Tensor):
         return self.decoder(X)
+    
+    def set_return_router_info(self, value: bool) -> None:
+        """
+        Dynamically enable/disable router info return.
+        Useful for switching between different loss functions during training.
+        """
+        self.return_router_info = value
+        self.decoder.return_router_info = value
+        self.decoder.moe.return_router_info = value
 
 if __name__ == "__main__":
     X = torch.randn(1, 2, 100)

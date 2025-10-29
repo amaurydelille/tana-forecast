@@ -3,6 +3,7 @@ from plotly.subplots import make_subplots
 import torch
 from typing import Dict, List, Optional
 from src.trainer import TimeSeriesDataset
+import numpy as np
 
 def plot_training_history(history: Dict[str, List[float]], height: int = 500, width: int = 1200) -> go.Figure:
     fig = make_subplots(
@@ -113,15 +114,23 @@ def compute_metrics(target: torch.Tensor, prediction: torch.Tensor) -> Dict[str,
     mse = ((target - prediction) ** 2).mean().item()
     mae = (target - prediction).abs().mean().item()
     rmse = mse ** 0.5
+    mape = ((target - prediction).abs() / target.abs()).mean().item()
+    smape = ((target - prediction).abs() / ((target.abs() + prediction.abs()) / 2)).mean().item()
+    r2 = (1 - ((target - prediction) ** 2).sum() / ((target - target.mean()) ** 2).sum()).item()
     
     return {
         'mse': mse,
         'mae': mae,
-        'rmse': rmse
+        'rmse': rmse,
+        'r2': r2,
+        'mape': mape,
+        'smape': smape
     }
 
-def print_metrics(metrics: Dict[str, float], unit: str = "") -> None:
-    print(f"MSE:  {metrics['mse']:.4f}{unit}")
-    print(f"MAE:  {metrics['mae']:.4f}{unit}")
-    print(f"RMSE: {metrics['rmse']:.4f}{unit}")
+def print_metrics(metrics: Dict[str, float]) -> None:
+    print(f"MSE:  {metrics['mse']:.4f}")
+    print(f"MAE:  {metrics['mae']:.4f}")
+    print(f"RMSE: {metrics['rmse']:.4f}")
+    print(f"MAPE: {metrics['mape']:.4f}")
+    print(f"SMAPE: {metrics['smape']:.4f}")
 

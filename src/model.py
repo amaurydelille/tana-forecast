@@ -70,6 +70,65 @@ class Patch(nn.Module):
         
         return X + pe
 
+class CrossLayer(nn.Module):
+    def __init__(self, d_model: int) -> None:
+        super().__init__()
+        self.d_model = d_model
+        self.weight = nn.Parameter(torch.randn(d_model, d_model))
+        self.bias = nn.Parameter(torch.zeros(d_model))
+        
+    def forward(self, x0: torch.Tensor, xl: torch.Tensor) -> torch.Tensor:
+        xl_w = torch.einsum('...d,de->...e', xl, self.weight)
+        xl_w_x0 = xl_w * x0
+        return xl_w_x0 + self.bias + xl
+
+class DeepCrossNetwork(nn.Module):
+    def __init__(
+        self, 
+        d_model: int, 
+        n_cross_layers: int = 3,
+        n_deep_layers: int = 3,
+        deep_hidden_dim: int = None,
+        dropout: float = 0.1
+    ) -> None:
+        super().__init__()
+        self.d_model = d_model
+        self.n_cross_layers = n_cross_layers
+        self.n_deep_layers = n_deep_layers
+        self.deep_hidden_dim = deep_hidden_dim or d_model * 2
+        
+        self.cross_layers = nn.ModuleList([
+            CrossLayer(d_model) for _ in range(n_cross_layers)
+        ])
+        
+        deep_layers = []
+        in_dim = d_model
+        for _ in range(n_deep_layers):
+            deep_layers.extend([
+                nn.Linear(in_dim, self.deep_hidden_dim),
+                nn.ReLU(),
+                nn.Dropout(dropout)
+            ])
+            in_dim = self.deep_hidden_dim
+        deep_layers.append(nn.Linear(self.deep_hidden_dim, d_model))
+        self.deep_network = nn.Sequential(*deep_layers)
+        
+        self.fusion = nn.Linear(d_model * 2, d_model)
+        
+    def forward(self, X: torch.Tensor) -> torch.Tensor:
+        x0 = X
+        xl = X
+        
+        for cross_layer in self.cross_layers:
+            xl = cross_layer(x0, xl)
+        
+        xd = self.deep_network(X)
+        
+        combined = torch.cat([xl, xd], dim=-1)
+        output = self.fusion(combined)
+        
+        return output
+
 class CausalSelfAttention(nn.Module):
     def __init__(self, d_model: int) -> None:
         super().__init__()
@@ -170,6 +229,7 @@ class Decoder(nn.Module):
             stride=STRIDE,
             d_out=D_OUT
         )
+        self.deep_cross = DeepCrossNetwork(d_model=D_OUT, n_cross_layers=3, n_deep_layers=3, deep_hidden_dim=D_OUT * 2, dropout=0.1)
         self.layer_norm_1 = nn.LayerNorm(D_OUT)
         self.attention = CausalSelfAttention(d_model=D_OUT)
         self.layer_norm_2 = nn.LayerNorm(D_OUT)
@@ -188,10 +248,11 @@ class Decoder(nn.Module):
             pooled = F.adaptive_avg_pool1d(X.transpose(1, 2), self.d_model).transpose(1, 2)
             return pooled
 
-    def forward(self, X: torch.Tensor):
+    def forward(self, X: torch.Tensor, prediction_length: int = 12):
         X = self.project_channels(X)
         
         X = self.patch(X)
+        X = self.deep_cross(X)
         X = self.layer_norm_1(X)
         X = self.attention(X)
         
@@ -225,8 +286,8 @@ class TanaForecast(nn.Module):
             return_router_info=return_router_info
         )
 
-    def forward(self, X: torch.Tensor):
-        return self.decoder(X)
+    def forward(self, X: torch.Tensor, prediction_length: int = 12):
+        return self.decoder(X, prediction_length)
     
     def set_return_router_info(self, value: bool) -> None:
         """
@@ -236,6 +297,10 @@ class TanaForecast(nn.Module):
         self.return_router_info = value
         self.decoder.return_router_info = value
         self.decoder.moe.return_router_info = value
+
+    def forecast(self, X: torch.Tensor, context_window: int, prediction_length: int) -> torch.Tensor:
+        X = X[:, -context_window:, :]
+        return self.forward(X, prediction_length)
 
 if __name__ == "__main__":
     X = torch.randn(1, 2, 100)

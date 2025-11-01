@@ -369,24 +369,52 @@ class TanaForecastTrainer:
         path = self.checkpoint_dir / f'checkpoint_epoch_{epoch}.pt'
         torch.save(checkpoint, path)
     
-    def load_checkpoint(self, checkpoint_path: str) -> None:
+    def load_checkpoint(self, checkpoint_path: str) -> int:
         checkpoint = torch.load(checkpoint_path, map_location=self.device)
         self.model.load_state_dict(checkpoint['model_state_dict'])
         self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
         self.best_val_loss = checkpoint['best_val_loss']
         self.history = checkpoint['history']
+        return checkpoint['epoch']
     
-    def train(self) -> Dict[str, List[float]]:
+    def find_latest_checkpoint(self) -> Optional[str]:
+        if self.checkpoint_dir is None or not self.checkpoint_dir.exists():
+            return None
+        
+        checkpoints = list(self.checkpoint_dir.glob('checkpoint_epoch_*.pt'))
+        if not checkpoints:
+            return None
+        
+        latest = max(checkpoints, key=lambda p: int(p.stem.split('_')[-1]))
+        return str(latest)
+    
+    def load_latest_checkpoint(self) -> int:
+        latest_path = self.find_latest_checkpoint()
+        if latest_path is None:
+            print("No checkpoint found, starting from scratch")
+            return 0
+        
+        print(f"Loading checkpoint: {latest_path}")
+        epoch = self.load_checkpoint(latest_path)
+        print(f"Resumed from epoch {epoch + 1}")
+        return epoch + 1
+    
+    def train(self, resume: bool = False) -> Dict[str, List[float]]:
+        start_epoch = 0
+        if resume:
+            start_epoch = self.load_latest_checkpoint()
+        
         print(f"Training on {self.device}")
         print(f"Total epochs: {self.num_epochs}")
+        print(f"Starting from epoch: {start_epoch + 1}")
         print(f"Batch size: {self.train_loader.batch_size}")
         print(f"Train batches: {len(self.train_loader)}")
         if self.val_loader:
             print(f"Val batches: {len(self.val_loader)}")
         print("-" * 60)
         
-        for epoch in range(self.num_epochs):
+        for epoch in range(start_epoch, self.num_epochs):
             start_time = time.time()
             
             train_loss = self.train_epoch()
@@ -432,12 +460,11 @@ class TanaForecastTrainer:
             else:
                 self.epochs_without_improvement += 1
             
+            self.save_checkpoint(epoch)
+            
             if self.early_stopping_patience != -1 and self.epochs_without_improvement >= self.early_stopping_patience:
                 print(f"\nEarly stopping triggered after {epoch+1} epochs")
                 break
-            
-            if (epoch + 1) % 10 == 0:
-                self.save_checkpoint(epoch)
         
         print("-" * 60)
         print(f"Training completed. Best Val Loss: {self.best_val_loss:.6f}")

@@ -11,89 +11,44 @@ import time
 import csv
 
 class Logger:
-    """
-    Logger class for recording training runs to CSV.
-    Columns: dataset_name, dataset_shape, model_parameters, epochs, loss_type, training_loss, validation_loss
-    """
+    """Log training runs into CSV files"""
     def __init__(self, csv_path: str) -> None:
         self.csv_path = Path(csv_path)
         self.csv_path.parent.mkdir(parents=True, exist_ok=True)
+        self.columns = ["run_type", "dataset_name", "dataset_shape", "model_parameters", "epoch", "total_epochs", "loss_type", "training_loss", "validation_loss", "training_history", "validation_history"]
         
-        # Create CSV with headers if it doesn't exist
-        if not self.csv_path.exists():
-            with open(self.csv_path, 'w', newline='') as f:
-                writer = csv.writer(f)
-                writer.writerow(['run_type', 'dataset_name', 'dataset_shape', 'model_parameters', 
-                               'epoch', 'total_epochs', 'loss_type', 'training_loss', 'validation_loss'])
+        file_exists = self.csv_path.exists() and self.csv_path.stat().st_size > 0
+        self.csv_file = open(self.csv_path, "a", newline='')
+        self.csv_writer = csv.DictWriter(self.csv_file, fieldnames=self.columns)
+        
+        if not file_exists:
+            self.csv_writer.writeheader()
+            self.csv_file.flush()
+
+    def log(self, run_type: str = None, dataset_name: str = None, dataset_shape: Tuple[int, int, int] = None, model_parameters: int = None, epoch: int = None, total_epochs: int = None, loss_type: str = None, training_loss: float = None, validation_loss: float = None, training_history: List[float] = None, validation_history: List[float] = None) -> None:
+        self.csv_writer.writerow({
+            "run_type": run_type,
+            "dataset_name": dataset_name,
+            "dataset_shape": str(dataset_shape),
+            "model_parameters": model_parameters,
+            "epoch": epoch,
+            "total_epochs": total_epochs,
+            "loss_type": loss_type,
+            "training_loss": training_loss,
+            "validation_loss": validation_loss,
+            "training_history": str(training_history),
+            "validation_history": str(validation_history)
+        })
+        self.csv_file.flush()
     
-    def log_run(
-        self,
-        dataset_name: str,
-        dataset_shape: Tuple[int, ...],
-        model_parameters: int,
-        epoch: int,
-        total_epochs: int,
-        loss_type: str,
-        training_loss: float,
-        validation_loss: float,
-        run_type: str = 'training'
-    ) -> None:
-        """
-        Log a training run to the CSV file.
-        
-        Args:
-            dataset_name: Name of the dataset used
-            dataset_shape: Shape of the dataset (e.g., (samples, features, sequence_length))
-            model_parameters: Total number of trainable parameters in the model
-            epoch: Current epoch number
-            total_epochs: Total number of epochs
-            loss_type: Type of loss function used (e.g., 'MSE', 'MAE', 'TimeMoE')
-            training_loss: Training loss
-            validation_loss: Validation loss
-            run_type: Type of run ('training', 'testing', 'final')
-        """
-        # Convert dataset_shape tuple to string representation
-        shape_str = str(dataset_shape)
-        
-        with open(self.csv_path, 'a', newline='') as f:
-            writer = csv.writer(f)
-            writer.writerow([
-                run_type,
-                dataset_name,
-                shape_str,
-                model_parameters,
-                epoch,
-                total_epochs,
-                loss_type,
-                f"{training_loss:.6f}",
-                f"{validation_loss:.6f}"
-            ])
+    def close(self) -> None:
+        """Close the CSV file"""
+        if self.csv_file and not self.csv_file.closed:
+            self.csv_file.close()
     
-    def read_logs(self) -> pd.DataFrame:
-        """Read all logs from the CSV file."""
-        if not self.csv_path.exists():
-            return pd.DataFrame(columns=['run_type', 'dataset_name', 'dataset_shape', 'model_parameters', 
-                                        'epoch', 'total_epochs', 'loss_type', 'training_loss', 'validation_loss'])
-        return pd.read_csv(self.csv_path)
-    
-    def get_best_run(self, metric: str = 'validation_loss') -> Optional[pd.Series]:
-        """
-        Get the best run based on a metric.
-        
-        Args:
-            metric: Metric to optimize (default: 'validation_loss')
-        
-        Returns:
-            Series containing the best run, or None if no logs exist
-        """
-        df = self.read_logs()
-        if df.empty:
-            return None
-        
-        if metric in ['training_loss', 'validation_loss']:
-            return df.loc[df[metric].idxmin()]
-        else:
-            return df.loc[df[metric].idxmax()]
+    def __del__(self) -> None:
+        """Ensure file is closed when Logger is destroyed"""
+        self.close()
 
 class TimeSeriesDataset(Dataset):
     def __init__(
@@ -104,15 +59,23 @@ class TimeSeriesDataset(Dataset):
         target_columns: Optional[List[str]] = None,
         feature_columns: Optional[List[str]] = None,
         stride: int = 1,
-        normalize: bool = True
+        normalize: bool = True,
+        flatten: bool = True
     ) -> None:
-        self.df = df.copy()
+        if hasattr(df, 'to_pandas'):
+            self.df = df.to_pandas()
+        elif isinstance(df, pd.DataFrame):
+            self.df = df.copy()
+        
+        if flatten:
+            self.df = self._flatten_dataframe(self.df)
+        
         self.context_window = context_window
         self.prediction_length = prediction_length
         self.stride = stride
         
         if feature_columns is None:
-            self.feature_columns = list(df.columns)
+            self.feature_columns = list(self.df.columns)
         else:
             self.feature_columns = feature_columns
             
@@ -139,6 +102,26 @@ class TimeSeriesDataset(Dataset):
             self.target_std = None
         
         self.valid_indices = self._compute_valid_indices()
+    
+    @staticmethod
+    def _flatten_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+        flattened_dfs = []
+        needs_flattening = False
+        
+        for index, row in df.iterrows():
+            first_value = row.iloc[0]
+            if isinstance(first_value, (list, np.ndarray)) and len(first_value) > 1:
+                needs_flattening = True
+                flat_data = {}
+                for col in df.columns:
+                    flat_data[col] = row[col]
+                flattened_dfs.append(pd.DataFrame(flat_data))
+            else:
+                flattened_dfs.append(pd.DataFrame([row]))
+        
+        if needs_flattening and flattened_dfs:
+            return pd.concat(flattened_dfs, ignore_index=True)
+        return df
     
     def _compute_valid_indices(self) -> List[int]:
         max_start_idx = len(self.df) - self.context_window - self.prediction_length
@@ -193,18 +176,23 @@ class TanaForecastTrainer:
         dataset_name: str = "unknown",
         loss_fn: Optional[callable] = None,
         loss_name: str = "MSE",
-        loss_kwargs: Optional[Dict] = None
+        loss_kwargs: Optional[Dict] = None,
+        allow_rerun: bool = False
     ) -> None:
         self.model = model.to(device)
         self.device = device
         self.num_epochs = num_epochs
         self.early_stopping_patience = early_stopping_patience
-        self.logger = logger
+        self.logger = Logger(csv_path='/Users/amaurydelille/Documents/projects/tana-forecast/src/logs/training_logs.csv')
         self.dataset_name = dataset_name
+
+        logs = pd.read_csv(logger.csv_path)
+        if dataset_name in logs['dataset_name'].values and not allow_rerun:
+            raise ValueError(f"Dataset {dataset_name} already exists in logs. Set allow_rerun=True to overwrite.")
+
         self.train_dataset = train_dataset
         self.val_dataset = val_dataset
-        
-        # Loss function configuration
+        self.allow_rerun = allow_rerun
         self.loss_name = loss_name
         self.loss_kwargs = loss_kwargs or {}
         if loss_fn is None:
@@ -255,6 +243,7 @@ class TanaForecastTrainer:
         
         self.best_val_loss = float('inf')
         self.epochs_without_improvement = 0
+
     
     @staticmethod
     def count_parameters(model: nn.Module) -> int:
@@ -328,7 +317,6 @@ class TanaForecastTrainer:
                 
                 if hasattr(self.model, 'return_router_info') and self.model.return_router_info:
                     predictions, router_probs, expert_indices = self.model(context)
-                    # Call loss function with router info
                     loss = self.criterion(
                         y_true=target,
                         y_pred=predictions,
@@ -338,7 +326,6 @@ class TanaForecastTrainer:
                     )
                 else:
                     predictions = self.model(context)
-                    # Simple loss function (MSE, MAE, Huber, Quantile, etc.)
                     if self.use_custom_loss:
                         loss = self.criterion(target, predictions, **self.loss_kwargs)
                     else:
@@ -435,23 +422,6 @@ class TanaForecastTrainer:
                   f"LR: {current_lr:.2e} | "
                   f"Time: {epoch_time:.2f}s")
             
-            # Log every epoch if logger is provided
-            if self.logger is not None:
-                num_params = self.count_parameters(self.model)
-                dataset_shape = self.get_dataset_shape()
-                
-                self.logger.log_run(
-                    dataset_name=self.dataset_name,
-                    dataset_shape=dataset_shape,
-                    model_parameters=num_params,
-                    epoch=epoch + 1,
-                    total_epochs=self.num_epochs,
-                    loss_type=self.loss_name,
-                    training_loss=train_loss,
-                    validation_loss=val_loss,
-                    run_type='training'
-                )
-            
             if val_loss < self.best_val_loss:
                 self.best_val_loss = val_loss
                 self.epochs_without_improvement = 0
@@ -465,6 +435,24 @@ class TanaForecastTrainer:
             if self.early_stopping_patience != -1 and self.epochs_without_improvement >= self.early_stopping_patience:
                 print(f"\nEarly stopping triggered after {epoch+1} epochs")
                 break
+
+        if self.logger is not None:
+                num_params = self.count_parameters(self.model)
+                dataset_shape = self.get_dataset_shape()
+                
+                self.logger.log(
+                    dataset_name=self.dataset_name,
+                    dataset_shape=dataset_shape,
+                    model_parameters=num_params,
+                    epoch=epoch + 1,
+                    total_epochs=self.num_epochs,
+                    loss_type=self.loss_name,
+                    training_loss=train_loss,
+                    validation_loss=val_loss,
+                    training_history=self.history['train_loss'],
+                    validation_history=self.history['val_loss'],
+                    run_type='training'
+                )
         
         print("-" * 60)
         print(f"Training completed. Best Val Loss: {self.best_val_loss:.6f}")
@@ -476,7 +464,8 @@ class TanaForecastTrainer:
             num_params = self.count_parameters(self.model)
             dataset_shape = self.get_dataset_shape()
             
-            self.logger.log_run(
+            self.logger.log(
+                run_type='training',
                 dataset_name=self.dataset_name,
                 dataset_shape=dataset_shape,
                 model_parameters=num_params,
@@ -485,7 +474,8 @@ class TanaForecastTrainer:
                 loss_type=self.loss_name,
                 training_loss=final_train_loss,
                 validation_loss=final_val_loss,
-                run_type='final'
+                training_history=self.history['train_loss'],
+                validation_history=self.history['val_loss'],
             )
             print(f"Training run logged to {self.logger.csv_path}")
         

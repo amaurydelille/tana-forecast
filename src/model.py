@@ -9,6 +9,8 @@ STRIDE = 12
 D_OUT = 64
 N_EXPERT = 8
 TOP_K = 4
+N_DECODERS = 6
+D_FF = 2048
 
 class Monitor:
     def __init__(self) -> None:
@@ -22,9 +24,6 @@ class Monitor:
         return self.expert_counts
 
 class Patch(nn.Module):
-    """
-    Cut the dataset into N patches.
-    """
     def __init__(
         self, 
         X: torch.Tensor, 
@@ -129,14 +128,17 @@ class DeepCrossNetwork(nn.Module):
         
         return output
 
-class CausalSelfAttention(nn.Module):
-    def __init__(self, d_model: int) -> None:
+class MultiHeadCausalSelfAttention(nn.Module):
+    def __init__(self, d_model: int, num_heads: int = 8) -> None:
         super().__init__()
         self.d_model = d_model
-        self.q = nn.Linear(d_model, d_model)
-        self.k = nn.Linear(d_model, d_model)
-        self.v = nn.Linear(d_model, d_model)
-        self.out = nn.Linear(d_model, d_model)
+        assert d_model % num_heads == 0, "d_model must be divisible by num_heads"
+        self.q = nn.Linear(in_features=d_model, out_features=d_model)
+        self.k = nn.Linear(in_features=d_model, out_features=d_model)
+        self.v = nn.Linear(in_features=d_model, out_features=d_model)
+        self.out = nn.Linear(in_features=d_model, out_features=d_model)
+        self.num_heads = num_heads
+        self.d_model_per_head = d_model // num_heads
 
     def forward(self, X: torch.Tensor) -> torch.Tensor:
         """
@@ -145,11 +147,11 @@ class CausalSelfAttention(nn.Module):
         """
         B, N, D = X.shape
 
-        q = self.q(X)
-        k = self.k(X)
-        v = self.v(X)
+        q = self.q(X).view(B, N, self.num_heads, self.d_model_per_head).transpose(1, 2)
+        k = self.k(X).view(B, N, self.num_heads, self.d_model_per_head).transpose(1, 2)
+        v = self.v(X).view(B, N, self.num_heads, self.d_model_per_head).transpose(1, 2)
 
-        attention_scores = (q @ k.transpose(-2, -1)) / math.sqrt(self.d_model)
+        attention_scores = (q @ k.transpose(-2, -1)) / math.sqrt(self.d_model_per_head)
 
         mask = torch.tril(torch.ones(N, N, device=X.device)) # this function stores the mask on CPU by default.
         mask = mask.masked_fill(mask == 0, float('-inf'))
@@ -157,7 +159,19 @@ class CausalSelfAttention(nn.Module):
         attention_scores = attention_scores + mask
         attention_weights = F.softmax(attention_scores, dim=-1)
 
-        return self.out(attention_weights @ v)
+        attended = attention_weights @ v
+        attended = attended.transpose(1, 2).contiguous().view(B, N, D)
+        return self.out(attended)
+
+class FeedForward(nn.Module):
+    def __init__(self, d_model: int, d_ff: int = 2048) -> None:
+        super().__init__()
+        self.fc1 = nn.Linear(in_features=d_model, out_features=d_ff)
+        self.dropout = nn.Dropout(p=0.2)
+        self.fc2 = nn.Linear(in_features=d_ff, out_features=d_model)
+
+    def forward(self, X: torch.Tensor) -> torch.Tensor:
+        return self.fc2(self.dropout(self.fc1(X)))
 
 class MixtureOfExpert(nn.Module):
     def __init__(
@@ -177,7 +191,7 @@ class MixtureOfExpert(nn.Module):
         self.d_model = d_model
         self.n_experts = n_experts
         self.top_k = top_k
-        self.experts = nn.ModuleList([nn.Linear(d_model, d_model) for _ in range(n_experts)])
+        self.experts = nn.ModuleList([FeedForward(d_model=d_model, d_ff=D_FF) for _ in range(n_experts)])
         self.router = nn.Linear(d_model, n_experts)
         self.out = nn.Linear(d_model, d_model)
         self.monitor = monitor
@@ -231,7 +245,7 @@ class Decoder(nn.Module):
         )
         self.deep_cross = DeepCrossNetwork(d_model=D_OUT, n_cross_layers=3, n_deep_layers=3, deep_hidden_dim=D_OUT * 2, dropout=0.1)
         self.layer_norm_1 = nn.LayerNorm(D_OUT)
-        self.attention = CausalSelfAttention(d_model=D_OUT)
+        self.attention = MultiHeadCausalSelfAttention(d_model=D_OUT)
         self.layer_norm_2 = nn.LayerNorm(D_OUT)
         self.moe = MixtureOfExpert(d_model=D_OUT, n_experts=N_EXPERT, top_k=TOP_K, monitor=self.monitor, return_router_info=return_router_info)
         self.out = nn.Linear(in_features=D_OUT, out_features=prediction_length)
@@ -270,8 +284,16 @@ class Decoder(nn.Module):
         return output
 
 class TanaForecast(nn.Module):
-    def __init__(self, context_window: int, prediction_length: int, return_router_info: bool = False) -> None:
+    def __init__(
+        self, 
+        context_window: int, 
+        prediction_length: int,
+        return_router_info: bool = False,
+        device: str = "mps" if torch.backends.mps.is_available() else "cpu"
+    ) -> None:
         super().__init__()
+
+        self.device = device if device is not None else "mps" if torch.backends.mps.is_available() else "cpu"
 
         # to monitor router activation
         self.monitor = Monitor()
@@ -279,15 +301,42 @@ class TanaForecast(nn.Module):
         self.context_window = context_window
         self.prediction_length = prediction_length
         self.return_router_info = return_router_info
-        self.decoder = Decoder(
-            context_window=context_window, 
-            prediction_length=prediction_length,
-            monitor=self.monitor,
-            return_router_info=return_router_info
-        )
+
+        self.decoders = nn.ModuleList([
+            Decoder(
+                context_window=context_window, 
+                prediction_length=prediction_length,
+                monitor=self.monitor,
+                return_router_info=return_router_info
+            ) for _ in range(N_DECODERS)
+        ])
+
+        self.number_of_parameters = sum(p.numel() for p in self.parameters())
 
     def forward(self, X: torch.Tensor, prediction_length: int = 12):
-        return self.decoder(X, prediction_length)
+        outputs = []
+        router_probs_list = []
+        expert_indices_list = []
+        
+        for decoder in self.decoders:
+            if self.return_router_info:
+                output, router_probs, expert_indices = decoder(X, prediction_length)
+                outputs.append(output)
+                router_probs_list.append(router_probs)
+                expert_indices_list.append(expert_indices)
+            else:
+                output = decoder(X, prediction_length)
+                outputs.append(output)
+        
+        stacked_outputs = torch.stack(outputs, dim=0)
+        mean_output = torch.mean(stacked_outputs, dim=0)
+        
+        if self.return_router_info:
+            stacked_router_probs = torch.stack(router_probs_list, dim=0)
+            stacked_expert_indices = torch.stack(expert_indices_list, dim=0)
+            return mean_output, stacked_router_probs, stacked_expert_indices
+        
+        return mean_output
     
     def set_return_router_info(self, value: bool) -> None:
         """
@@ -295,8 +344,9 @@ class TanaForecast(nn.Module):
         Useful for switching between different loss functions during training.
         """
         self.return_router_info = value
-        self.decoder.return_router_info = value
-        self.decoder.moe.return_router_info = value
+        for decoder in self.decoders:
+            decoder.return_router_info = value
+            decoder.moe.return_router_info = value
 
     def forecast(self, X: torch.Tensor, context_window: int, prediction_length: int) -> torch.Tensor:
         X = X[:, -context_window:, :]

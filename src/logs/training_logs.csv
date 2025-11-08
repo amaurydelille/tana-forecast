@@ -1,0 +1,1 @@
+run_type,dataset_name,dataset_shape,model_parameters,epoch,total_epochs,loss_type,training_loss,validation_loss,training_history,validation_history,unknown,"(1366, 4, 90)",13828698,3,3,Quantile_0.9,0.05617038533091545,0.18964333832263947,"[0.11353287947448817, 0.06442258913408626, 0.05617038533091545]","[0.12545715272426605, 0.20469193160533905, 0.18964333832263947]"

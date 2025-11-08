@@ -1,8 +1,11 @@
+import datetime
+import pandas as pd
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
-from typing import List
+from typing import List, Iterable, Union
 
 PATCH_SIZE = 24
 STRIDE = 12
@@ -11,6 +14,76 @@ N_EXPERT = 8
 TOP_K = 4
 N_DECODERS = 6
 D_FF = 2048
+
+def universal_timestamp_normalized(
+    timestamps: Union[pd.Series, torch.Tensor, np.ndarray, Iterable[Union[datetime.datetime, pd.Timestamp, str, int, float]]],
+    device: str = "cpu"
+) -> torch.Tensor:
+    """
+    Universally normalize timestamps to days since epoch (1970-01-01).
+    
+    Supports multiple input formats:
+    - pandas Series with datetime/timestamp dtypes
+    - torch.Tensor or numpy arrays (treated as Unix timestamps in seconds)
+    - Lists of datetime objects, pd.Timestamp, or strings
+    - Numeric values (treated as Unix timestamps)
+    
+    Args:
+        timestamps: Input timestamps in various formats
+        device: device to create tensor on (default: "cpu")
+    
+    Returns:
+        torch.Tensor: Normalized timestamps as float32 tensor (days since 1970-01-01)
+    """
+    SCALING_CONSTANT = 86400.0
+    
+    if isinstance(timestamps, torch.Tensor):
+        timestamps_np = timestamps.cpu().numpy() if timestamps.is_cuda else timestamps.numpy()
+        days_since_epoch = timestamps_np.astype(np.float64) / SCALING_CONSTANT
+        return torch.tensor(days_since_epoch, dtype=torch.float32, device=device)
+    
+    if isinstance(timestamps, np.ndarray):
+        if timestamps.dtype.kind in ['M', 'm']:
+            timestamps = pd.Series(timestamps)
+        else:
+            days_since_epoch = timestamps.astype(np.float64) / SCALING_CONSTANT
+            return torch.tensor(days_since_epoch, dtype=torch.float32, device=device)
+    
+    if isinstance(timestamps, pd.Series):
+        if pd.api.types.is_datetime64_any_dtype(timestamps):
+            min_timestamp = pd.Timestamp('1970-01-01')
+            days_since_epoch = (timestamps - min_timestamp).dt.total_seconds() / SCALING_CONSTANT
+            return torch.tensor(days_since_epoch.values, dtype=torch.float32, device=device)
+        else:
+            timestamps = timestamps.values
+    
+    min_timestamp = pd.Timestamp('1970-01-01')
+    normalized = []
+    
+    for timestamp in timestamps:
+        if isinstance(timestamp, (int, float)):
+            days_since_epoch = float(timestamp) / SCALING_CONSTANT
+            normalized.append(days_since_epoch)
+        elif isinstance(timestamp, str):
+            try:
+                ts = pd.Timestamp(timestamp)
+                days_since_epoch = (ts - min_timestamp).total_seconds() / SCALING_CONSTANT
+                normalized.append(float(days_since_epoch))
+            except (ValueError, TypeError):
+                normalized.append(0.0)
+        elif isinstance(timestamp, (datetime.datetime, pd.Timestamp)):
+            days_since_epoch = (pd.Timestamp(timestamp) - min_timestamp).total_seconds() / SCALING_CONSTANT
+            normalized.append(float(days_since_epoch))
+        else:
+            try:
+                ts = pd.Timestamp(timestamp)
+                days_since_epoch = (ts - min_timestamp).total_seconds() / SCALING_CONSTANT
+                normalized.append(float(days_since_epoch))
+            except (ValueError, TypeError):
+                normalized.append(0.0)
+    
+    return torch.tensor(normalized, dtype=torch.float32, device=device)
+
 
 class Monitor:
     def __init__(self) -> None:

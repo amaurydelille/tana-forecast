@@ -9,13 +9,14 @@ from typing import Optional, List, Tuple, Dict
 from pathlib import Path
 import time
 import csv
+from src.model import universal_timestamp_normalized
 
 class Logger:
     """Log training runs into CSV files"""
     def __init__(self, csv_path: str) -> None:
         self.csv_path = Path(csv_path)
         self.csv_path.parent.mkdir(parents=True, exist_ok=True)
-        self.columns = ["run_type", "dataset_name", "dataset_shape", "model_parameters", "epoch", "total_epochs", "loss_type", "training_loss", "validation_loss", "training_history", "validation_history"]
+        self.columns = ["run_type", "dataset_name", "dataset_shape", "model_parameters", "epoch", "total_epochs", "loss_type", "training_loss", "validation_loss", "training_history", "validation_history", "timestamp"]
         
         file_exists = self.csv_path.exists() and self.csv_path.stat().st_size > 0
         self.csv_file = open(self.csv_path, "a", newline='')
@@ -25,7 +26,7 @@ class Logger:
             self.csv_writer.writeheader()
             self.csv_file.flush()
 
-    def log(self, run_type: str = None, dataset_name: str = None, dataset_shape: Tuple[int, int, int] = None, model_parameters: int = None, epoch: int = None, total_epochs: int = None, loss_type: str = None, training_loss: float = None, validation_loss: float = None, training_history: List[float] = None, validation_history: List[float] = None) -> None:
+    def log(self, run_type: str = None, dataset_name: str = None, dataset_shape: Tuple[int, int, int] = None, model_parameters: int = None, epoch: int = None, total_epochs: int = None, loss_type: str = None, training_loss: float = None, validation_loss: float = None, training_history: List[float] = None, validation_history: List[float] = None, timestamp: float = None) -> None:
         self.csv_writer.writerow({
             "run_type": run_type,
             "dataset_name": dataset_name,
@@ -37,7 +38,8 @@ class Logger:
             "training_loss": training_loss,
             "validation_loss": validation_loss,
             "training_history": str(training_history),
-            "validation_history": str(validation_history)
+            "validation_history": str(validation_history),
+            "timestamp": timestamp if timestamp is not None else time.time()
         })
         self.csv_file.flush()
     
@@ -84,6 +86,8 @@ class TimeSeriesDataset(Dataset):
         else:
             self.target_columns = target_columns
         
+        self.df = self._normalize_timestamp_columns(self.df, self.feature_columns)
+        
         self.feature_data = self.df[self.feature_columns].values.astype(np.float32)
         self.target_data = self.df[self.target_columns].values.astype(np.float32)
         
@@ -121,6 +125,55 @@ class TimeSeriesDataset(Dataset):
         
         if needs_flattening and flattened_dfs:
             return pd.concat(flattened_dfs, ignore_index=True)
+        return df
+    
+    @staticmethod
+    def _normalize_timestamp_columns(df: pd.DataFrame, feature_columns: List[str]) -> pd.DataFrame:
+        """
+        Automatically detect and normalize timestamp columns in the dataframe.
+        
+        Handles:
+        - pandas datetime columns
+        - string timestamps
+        - torch.Tensor timestamps (from Chronos datasets)
+        - numpy array timestamps
+        
+        Args:
+            df: Input dataframe
+            feature_columns: List of feature column names to check
+        
+        Returns:
+            DataFrame with timestamp columns normalized to numeric values (days since 1970-01-01)
+        """
+        df = df.copy()
+        
+        for col in feature_columns:
+            if col not in df.columns:
+                continue
+            
+            col_data = df[col]
+            
+            if isinstance(col_data.iloc[0] if len(col_data) > 0 else None, torch.Tensor):
+                tensor_timestamps = torch.stack([x if isinstance(x, torch.Tensor) else torch.tensor(x) for x in col_data.values])
+                normalized = universal_timestamp_normalized(tensor_timestamps, device="cpu")
+                df[col] = normalized.numpy()
+            elif pd.api.types.is_datetime64_any_dtype(col_data):
+                normalized = universal_timestamp_normalized(col_data, device="cpu")
+                df[col] = normalized.numpy()
+            elif col_data.dtype == 'object':
+                try:
+                    test_val = col_data.iloc[0] if len(col_data) > 0 else None
+                    if test_val is not None:
+                        if isinstance(test_val, (torch.Tensor, np.ndarray)):
+                            normalized = universal_timestamp_normalized(col_data.values, device="cpu")
+                            df[col] = normalized.numpy()
+                        else:
+                            pd.to_datetime(col_data.iloc[:5])
+                            normalized = universal_timestamp_normalized(col_data, device="cpu")
+                            df[col] = normalized.numpy()
+                except (ValueError, TypeError, AttributeError):
+                    pass
+        
         return df
     
     def _compute_valid_indices(self) -> List[int]:
@@ -186,7 +239,7 @@ class TanaForecastTrainer:
         self.logger = Logger(csv_path='/Users/amaurydelille/Documents/projects/tana-forecast/src/logs/training_logs.csv')
         self.dataset_name = dataset_name
 
-        logs = pd.read_csv(logger.csv_path)
+        logs = pd.read_csv(self.logger.csv_path)
         if dataset_name in logs['dataset_name'].values and not allow_rerun:
             raise ValueError(f"Dataset {dataset_name} already exists in logs. Set allow_rerun=True to overwrite.")
 
@@ -435,24 +488,6 @@ class TanaForecastTrainer:
             if self.early_stopping_patience != -1 and self.epochs_without_improvement >= self.early_stopping_patience:
                 print(f"\nEarly stopping triggered after {epoch+1} epochs")
                 break
-
-        if self.logger is not None:
-                num_params = self.count_parameters(self.model)
-                dataset_shape = self.get_dataset_shape()
-                
-                self.logger.log(
-                    dataset_name=self.dataset_name,
-                    dataset_shape=dataset_shape,
-                    model_parameters=num_params,
-                    epoch=epoch + 1,
-                    total_epochs=self.num_epochs,
-                    loss_type=self.loss_name,
-                    training_loss=train_loss,
-                    validation_loss=val_loss,
-                    training_history=self.history['train_loss'],
-                    validation_history=self.history['val_loss'],
-                    run_type='training'
-                )
         
         print("-" * 60)
         print(f"Training completed. Best Val Loss: {self.best_val_loss:.6f}")

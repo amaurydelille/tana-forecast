@@ -9,7 +9,7 @@ from typing import Optional, List, Tuple, Dict
 from pathlib import Path
 import time
 import csv
-from src.model import universal_timestamp_normalized
+from src.utils import TimeStamps
 
 class Logger:
     """Log training runs into CSV files"""
@@ -163,21 +163,21 @@ class TimeSeriesDataset(Dataset):
                 
         if isinstance(col_data.iloc[0] if len(col_data) > 0 else None, torch.Tensor):
             tensor_timestamps = torch.stack([x if isinstance(x, torch.Tensor) else torch.tensor(x) for x in col_data.values])
-            normalized = universal_timestamp_normalized(tensor_timestamps, device="cpu")
+            normalized = TimeStamps.universal_timestamp_normalized(tensor_timestamps, device="cpu")
             df[timestamp_column] = normalized.numpy()
         elif pd.api.types.is_datetime64_any_dtype(col_data):
-            normalized = universal_timestamp_normalized(col_data, device="cpu")
+            normalized = TimeStamps.universal_timestamp_normalized(col_data, device="cpu")
             df[timestamp_column] = normalized.numpy()
         elif col_data.dtype == 'object':
             try:
                 test_val = col_data.iloc[0] if len(col_data) > 0 else None
                 if test_val is not None:
                     if isinstance(test_val, (torch.Tensor, np.ndarray)):
-                        normalized = universal_timestamp_normalized(col_data.values, device="cpu")
+                        normalized = TimeStamps.universal_timestamp_normalized(col_data.values, device="cpu")
                         df[timestamp_column] = normalized.numpy()
                     else:
                         pd.to_datetime(col_data.iloc[:5])
-                        normalized = universal_timestamp_normalized(col_data, device="cpu")
+                        normalized = TimeStamps.universal_timestamp_normalized(col_data, device="cpu")
                         df[timestamp_column] = normalized.numpy()
             except (ValueError, TypeError, AttributeError):
                 pass

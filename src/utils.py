@@ -1,6 +1,9 @@
 import torch
 import torch.nn.functional as F
-from typing import Tuple, Dict, Optional, Callable
+from typing import Tuple, Dict, Optional, Callable, Union, Iterable
+import pandas as pd
+import numpy as np
+import datetime
 
 def get_loss_config(loss_type: str, **kwargs) -> Tuple[Optional[Callable], str, Dict, bool]:
     """
@@ -196,3 +199,109 @@ class Loss:
             MAE loss
         """
         return F.l1_loss(y_pred, y_true)
+
+class TimeStamps:
+    @staticmethod
+    def universal_timestamp_normalized(
+        timestamps: Union[pd.Series, torch.Tensor, np.ndarray, Iterable[Union[datetime.datetime, pd.Timestamp, str, int, float]]],
+        device: str = "cpu"
+    ) -> torch.Tensor:
+        """
+        Universally normalize timestamps to days since epoch (1970-01-01).
+        
+        Supports multiple input formats:
+        - pandas Series with datetime/timestamp dtypes
+        - torch.Tensor or numpy arrays (treated as Unix timestamps in seconds)
+        - Lists of datetime objects, pd.Timestamp, or strings
+        - Numeric values (treated as Unix timestamps)
+        
+        Args:
+            timestamps: Input timestamps in various formats
+            device: device to create tensor on (default: "cpu")
+        
+        Returns:
+            torch.Tensor: Normalized timestamps as float32 tensor (days since 1970-01-01)
+        """
+        SCALING_CONSTANT = 86400.0
+        
+        if isinstance(timestamps, torch.Tensor):
+            timestamps_np = timestamps.cpu().numpy() if timestamps.is_cuda else timestamps.numpy()
+            days_since_epoch = timestamps_np.astype(np.float64) / SCALING_CONSTANT
+            return torch.tensor(days_since_epoch, dtype=torch.float32, device=device)
+        
+        if isinstance(timestamps, np.ndarray):
+            if timestamps.dtype.kind in ['M', 'm']:
+                timestamps = pd.Series(timestamps)
+            else:
+                days_since_epoch = timestamps.astype(np.float64) / SCALING_CONSTANT
+                return torch.tensor(days_since_epoch, dtype=torch.float32, device=device)
+        
+        if isinstance(timestamps, pd.Series):
+            if pd.api.types.is_datetime64_any_dtype(timestamps):
+                min_timestamp = pd.Timestamp('1970-01-01')
+                days_since_epoch = (timestamps - min_timestamp).dt.total_seconds() / SCALING_CONSTANT
+                return torch.tensor(days_since_epoch.values, dtype=torch.float32, device=device)
+            else:
+                timestamps = timestamps.values
+        
+        min_timestamp = pd.Timestamp('1970-01-01')
+        normalized = []
+        
+        for timestamp in timestamps:
+            if isinstance(timestamp, (int, float)):
+                days_since_epoch = float(timestamp) / SCALING_CONSTANT
+                normalized.append(days_since_epoch)
+            elif isinstance(timestamp, str):
+                try:
+                    ts = pd.Timestamp(timestamp)
+                    days_since_epoch = (ts - min_timestamp).total_seconds() / SCALING_CONSTANT
+                    normalized.append(float(days_since_epoch))
+                except (ValueError, TypeError):
+                    normalized.append(0.0)
+            elif isinstance(timestamp, (datetime.datetime, pd.Timestamp)):
+                days_since_epoch = (pd.Timestamp(timestamp) - min_timestamp).total_seconds() / SCALING_CONSTANT
+                normalized.append(float(days_since_epoch))
+            else:
+                try:
+                    ts = pd.Timestamp(timestamp)
+                    days_since_epoch = (ts - min_timestamp).total_seconds() / SCALING_CONSTANT
+                    normalized.append(float(days_since_epoch))
+                except (ValueError, TypeError):
+                    normalized.append(0.0)
+        
+        return torch.tensor(normalized, dtype=torch.float32, device=device)
+
+    @staticmethod
+    def infer_frequency(timestamps: Union[pd.Series, torch.Tensor, np.ndarray, Iterable[Union[datetime.datetime, pd.Timestamp, str, int, float]]]) -> str:
+        """
+        Infer the frequency of the timestamps.
+        
+        Args:
+            timestamps: Input timestamps in various formats
+        """
+        if isinstance(timestamps, pd.Series):
+            return timestamps.infer_freq()
+        elif isinstance(timestamps, torch.Tensor) or isinstance(timestamps, np.ndarray):
+            return pd.infer_freq(timestamps)
+        else:
+            raise ValueError(f"Unsupported type: {type(timestamps)}")
+
+class Constants:
+    @staticmethod
+    def infer_context_window(frequency: str) -> int:
+        """
+        Infer the context window based on the frequency.
+        For now we use roughly 2 years of data as the context window.
+        Args:
+            frequency: Frequency of the timestamps
+        """
+        if frequency == 'D':
+            return 730
+        elif frequency == 'W':
+            return 104
+        elif frequency == 'M':
+            return 24
+        elif frequency == 'Y':
+            return 2
+        elif frequency == 'H':
+            pass

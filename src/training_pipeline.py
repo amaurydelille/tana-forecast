@@ -12,8 +12,8 @@ from src.trainer import TanaForecastTrainer, TimeSeriesDataset
 from src.utils import Loss
 from typing import List, Optional
 
-CONTEXT_WINDOW = 90
-PREDICTION_LENGTH = 7
+CONTEXT_WINDOW = 4096
+PREDICTION_LENGTH = 256
 
 class RunDatasetTraining:
     def __init__(
@@ -85,11 +85,11 @@ class RunDatasetTraining:
         self.trainer.train()
 
 if __name__ == "__main__":
-    train_dataset = pd.read_csv(project_root / 'src' / 'datasets' / 'microsoft_stocks' / 'train.csv')
+    train_dataset = pd.read_csv(project_root / 'src' / 'datasets' / 'stock_china' / '000001.XSHE.csv')
 
-    feature_columns = ['Open','High','Low','Volume']
-    target_columns = ['Close']
-    timestamp_column = 'Date'
+    feature_columns = ['open','high','low','volume','money','avg','high_limit','low_limit','pre_close','paused','factor']
+    target_columns = ['close']
+    timestamp_column = 'timestamp'
 
     run_dataset_training = RunDatasetTraining(
         train_dataset=train_dataset,

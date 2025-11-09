@@ -362,7 +362,7 @@ class TanaForecastTrainer:
             
             total_loss += loss.item()
             num_batches += 1
-            logger.info(f"Train batch {num_batches} loss: {loss.item()} in {time.time() - start_time:.2f}s")
+            logger.info(f"Train batch {num_batches}/{len(self.train_loader)} loss: {loss.item()} in {time.time() - start_time:.2f}s")
         
         return total_loss / num_batches
     

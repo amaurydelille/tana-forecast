@@ -277,6 +277,8 @@ class TanaForecastTrainer:
                 num_workers=0,
                 pin_memory=True
             )
+        else:
+            self.test_loader = None
         
         self.optimizer = AdamW(
             self.model.parameters(),
@@ -395,7 +397,8 @@ class TanaForecastTrainer:
         
         return total_loss / num_batches
     
-    def save_checkpoint(self, epoch: int, is_best: bool = False) -> None:
+    def save_checkpoint(self, epoch: int) -> None:
+        """Save model checkpoint at the end of training."""
         if self.checkpoint_dir is None:
             return
         
@@ -408,11 +411,7 @@ class TanaForecastTrainer:
             'history': self.history
         }
         
-        if is_best:
-            path = self.checkpoint_dir / 'best_model.pt'
-            torch.save(checkpoint, path)
-        
-        path = self.checkpoint_dir / f'checkpoint_epoch_{epoch}.pt'
+        path = self.checkpoint_dir / 'final_model.pt'
         torch.save(checkpoint, path)
     
     def load_checkpoint(self, checkpoint_path: str) -> int:
@@ -443,17 +442,22 @@ class TanaForecastTrainer:
         return checkpoint['epoch']
     
     def find_latest_checkpoint(self) -> Optional[str]:
+        """Find the latest checkpoint (final_model.pt)."""
         if self.checkpoint_dir is None or not self.checkpoint_dir.exists():
             return None
         
-        checkpoints = list(self.checkpoint_dir.glob('checkpoint_epoch_*.pt'))
-        if not checkpoints:
-            return None
+        final_model_path = self.checkpoint_dir / 'final_model.pt'
+        if final_model_path.exists():
+            return str(final_model_path)
         
-        latest = max(checkpoints, key=lambda p: int(p.stem.split('_')[-1]))
-        return str(latest)
+        return None
     
     def load_latest_checkpoint(self) -> int:
+        """Load the latest checkpoint (final_model.pt) if it exists.
+        
+        Returns:
+            The next epoch to start training from (0 if no checkpoint found)
+        """
         latest_path = self.find_latest_checkpoint()
         if latest_path is None:
             print("No checkpoint found, starting from scratch")
@@ -461,10 +465,21 @@ class TanaForecastTrainer:
         
         print(f"Loading checkpoint: {latest_path}")
         epoch = self.load_checkpoint(latest_path)
-        print(f"Resumed from epoch {epoch + 1}")
-        return epoch + 1
+        print(f"Loaded checkpoint from epoch {epoch + 1}")
+        next_epoch = epoch + 1
+        
+        if next_epoch >= self.num_epochs:
+            print(f"Warning: Checkpoint is from epoch {epoch + 1}, but num_epochs={self.num_epochs}. "
+                  f"Training will start from epoch {next_epoch}. Increase num_epochs to continue training.")
+        
+        return next_epoch
     
-    def train(self, resume: bool = False) -> Dict[str, List[float]]:
+    def train(self, resume: bool = True) -> Dict[str, List[float]]:
+        """Train the model. Automatically loads final_model.pt if it exists.
+        
+        Args:
+            resume: If True, automatically load final_model.pt if it exists (default: True)
+        """
         start_epoch = 0
         if resume:
             start_epoch = self.load_latest_checkpoint()
@@ -474,7 +489,7 @@ class TanaForecastTrainer:
         print(f"Starting from epoch: {start_epoch + 1}")
         print(f"Batch size: {self.train_loader.batch_size}")
         print(f"Train batches: {len(self.train_loader)}")
-        if self.test_loader:
+        if self.test_loader is not None:
             print(f"Test batches: {len(self.test_loader)}")
         print("-" * 60)
         
@@ -502,19 +517,20 @@ class TanaForecastTrainer:
             if test_loss < self.best_test_loss:
                 self.best_test_loss = test_loss
                 self.epochs_without_improvement = 0
-                self.save_checkpoint(epoch, is_best=True)
-                print(f"  → New best model saved (Test Loss: {test_loss:.6f})")
             else:
                 self.epochs_without_improvement += 1
-            
-            self.save_checkpoint(epoch)
             
             if self.early_stopping_patience != -1 and self.epochs_without_improvement >= self.early_stopping_patience:
                 print(f"\nEarly stopping triggered after {epoch+1} epochs")
                 break
         
+        # Save model at the end of training
+        final_epoch = epoch
+        self.save_checkpoint(final_epoch)
         print("-" * 60)
         print(f"Training completed. Best Test Loss: {self.best_test_loss:.6f}")
+        if self.checkpoint_dir is not None:
+            print(f"Final model saved to {self.checkpoint_dir / 'final_model.pt'}")
         
         if self.logger is not None:
             final_train_loss = self.history['train_loss'][-1]

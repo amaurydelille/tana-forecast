@@ -45,9 +45,8 @@ def get_loss_config(loss_type: str, **kwargs) -> Tuple[Optional[Callable], str, 
         return Loss.quantile_loss, f'Quantile_{q}', {'q': q}, False
     
     elif loss_type == 'timemoe':
-        from src.model import N_EXPERT, TOP_K
-        n_experts = kwargs.get('n_experts', N_EXPERT)
-        top_k = kwargs.get('top_k', TOP_K)
+        n_experts = kwargs.get('n_experts', Constants.n_experts)
+        top_k = kwargs.get('top_k', Constants.top_k)
         alpha = kwargs.get('alpha', 0.01)
         return (
             Loss.time_moe_loss,
@@ -295,6 +294,7 @@ class Constants:
         Args:
             frequency: Frequency of the timestamps
         """
+        raise NotImplementedError("Not implemented")
         if frequency == 'D':
             return 730
         elif frequency == 'W':
@@ -305,3 +305,16 @@ class Constants:
             return 2
         elif frequency == 'H':
             pass
+
+    context_window: int = 4096
+    prediction_length: int = 256
+    batch_size: int = 2048
+    learning_rate: float = 1e-3
+    num_epochs: int = 100
+    patch_size: int = 24
+    stride: int = 12
+    d_out: int = 64
+    n_experts: int = 8
+    top_k: int = 4
+    n_decoders: int = 6
+    d_ff: int = 2048

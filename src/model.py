@@ -7,17 +7,11 @@ import torch.nn.functional as F
 import math
 from typing import List, Iterable, Union
 
-PATCH_SIZE = 24
-STRIDE = 12
-D_OUT = 64
-N_EXPERT = 8
-TOP_K = 4
-N_DECODERS = 6
-D_FF = 2048
+from src.utils import Constants
 
 class Monitor:
     def __init__(self) -> None:
-        self.expert_counts = [0] * N_EXPERT
+        self.expert_counts = [0] * Constants.n_experts
 
     def update_expert_counts(self, expert_ids: torch.Tensor) -> None:
         for expert_id in expert_ids.unique():
@@ -193,7 +187,7 @@ class MixtureOfExpert(nn.Module):
         self.d_model = d_model
         self.n_experts = n_experts
         self.top_k = top_k
-        self.experts = nn.ModuleList([FeedForward(d_model=d_model, d_ff=D_FF) for _ in range(n_experts)])
+        self.experts = nn.ModuleList([FeedForward(d_model=d_model, d_ff=Constants.d_ff) for _ in range(n_experts)])
         self.router = nn.Linear(d_model, n_experts)
         self.out = nn.Linear(d_model, d_model)
         self.monitor = monitor
@@ -241,16 +235,16 @@ class Decoder(nn.Module):
         self.patch = Patch(
             X=torch.zeros(1, d_model, context_window),
             context_window=context_window,
-            patch_size=PATCH_SIZE,
-            stride=STRIDE,
-            d_out=D_OUT
+            patch_size=Constants.patch_size,
+            stride=Constants.stride,
+            d_out=Constants.d_out
         )
-        self.deep_cross = DeepCrossNetwork(d_model=D_OUT, n_cross_layers=3, n_deep_layers=3, deep_hidden_dim=D_OUT * 2, dropout=0.1)
-        self.layer_norm_1 = nn.LayerNorm(D_OUT)
-        self.attention = MultiHeadCausalSelfAttention(d_model=D_OUT)
-        self.layer_norm_2 = nn.LayerNorm(D_OUT)
-        self.moe = MixtureOfExpert(d_model=D_OUT, n_experts=N_EXPERT, top_k=TOP_K, monitor=self.monitor, return_router_info=return_router_info)
-        self.out = nn.Linear(in_features=D_OUT, out_features=prediction_length)
+        self.deep_cross = DeepCrossNetwork(d_model=Constants.d_out, n_cross_layers=3, n_deep_layers=3, deep_hidden_dim=Constants.d_out * 2, dropout=0.1)
+        self.layer_norm_1 = nn.LayerNorm(Constants.d_out)
+        self.attention = MultiHeadCausalSelfAttention(d_model=Constants.d_out)
+        self.layer_norm_2 = nn.LayerNorm(Constants.d_out)
+        self.moe = MixtureOfExpert(d_model=Constants.d_out, n_experts=Constants.n_experts, top_k=Constants.top_k, monitor=self.monitor, return_router_info=return_router_info)
+        self.out = nn.Linear(in_features=Constants.d_out, out_features=prediction_length)
 
     def project_channels(self, X: torch.Tensor) -> torch.Tensor:
         B, C, L = X.shape
@@ -310,7 +304,7 @@ class TanaForecast(nn.Module):
                 prediction_length=prediction_length,
                 monitor=self.monitor,
                 return_router_info=return_router_info
-            ) for _ in range(N_DECODERS)
+            ) for _ in range(Constants.n_decoders)
         ])
 
         self.number_of_parameters = sum(p.numel() for p in self.parameters())

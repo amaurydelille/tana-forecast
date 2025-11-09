@@ -9,11 +9,8 @@ sys.path.insert(0, str(project_root))
 
 from src.model import TanaForecast
 from src.trainer import TanaForecastTrainer, TimeSeriesDataset
-from src.utils import Loss
+from src.utils import Loss, Constants
 from typing import List, Optional
-
-CONTEXT_WINDOW = 4096
-PREDICTION_LENGTH = 256
 
 class RunDatasetTraining:
     def __init__(
@@ -93,10 +90,10 @@ if __name__ == "__main__":
 
     run_dataset_training = RunDatasetTraining(
         train_dataset=train_dataset,
-        dataset_name='microsoft_stocks',
+        dataset_name='stock_china',
         test_dataset=None,
-        context_window=CONTEXT_WINDOW,
-        prediction_length=PREDICTION_LENGTH,
+        context_window=Constants.context_window,
+        prediction_length=Constants.prediction_length,
         feature_columns=feature_columns,
         target_columns=target_columns,
         timestamp_column=timestamp_column

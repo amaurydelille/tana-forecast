@@ -10,6 +10,10 @@ from pathlib import Path
 import time
 import csv
 from src.utils import TimeStamps
+import logging
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
 class Logger:
     """Log training runs into CSV files"""
@@ -325,7 +329,8 @@ class TanaForecastTrainer:
         self.model.train()
         total_loss = 0.0
         num_batches = 0
-        
+        start_time = time.time()
+
         for context, target in self.train_loader:
             context = context.to(self.device)
             target = target.to(self.device)
@@ -357,6 +362,7 @@ class TanaForecastTrainer:
             
             total_loss += loss.item()
             num_batches += 1
+            logger.info(f"Train batch {num_batches} loss: {loss.item()} in {time.time() - start_time:.2f}s")
         
         return total_loss / num_batches
     
@@ -480,18 +486,22 @@ class TanaForecastTrainer:
         Args:
             resume: If True, automatically load final_model.pt if it exists (default: True)
         """
+
+        if self.test_loader is not None:
+            logger.info(f"Test batches: {len(self.test_loader)}")
+        logger.info("-" * 60)
         start_epoch = 0
         if resume:
             start_epoch = self.load_latest_checkpoint()
         
-        print(f"Training on {self.device}")
-        print(f"Total epochs: {self.num_epochs}")
-        print(f"Starting from epoch: {start_epoch + 1}")
-        print(f"Batch size: {self.train_loader.batch_size}")
-        print(f"Train batches: {len(self.train_loader)}")
+        logger.info(f"Training on {self.device}")
+        logger.info(f"Total epochs: {self.num_epochs}")
+        logger.info(f"Starting from epoch: {start_epoch + 1}")
+        logger.info(f"Batch size: {self.train_loader.batch_size}")
+        logger.info(f"Train batches: {len(self.train_loader)}")
         if self.test_loader is not None:
-            print(f"Test batches: {len(self.test_loader)}")
-        print("-" * 60)
+            logger.info(f"Test batches: {len(self.test_loader)}")
+        logger.info("-" * 60)
         
         for epoch in range(start_epoch, self.num_epochs):
             start_time = time.time()
@@ -508,7 +518,7 @@ class TanaForecastTrainer:
             
             epoch_time = time.time() - start_time
             
-            print(f"Epoch {epoch+1}/{self.num_epochs} | "
+            logger.info(f"Epoch {epoch+1}/{self.num_epochs} | "
                   f"Train Loss: {train_loss:.6f} | "
                   f"Test Loss: {test_loss:.6f} | "
                   f"LR: {current_lr:.2e} | "
@@ -521,16 +531,16 @@ class TanaForecastTrainer:
                 self.epochs_without_improvement += 1
             
             if self.early_stopping_patience != -1 and self.epochs_without_improvement >= self.early_stopping_patience:
-                print(f"\nEarly stopping triggered after {epoch+1} epochs")
+                logger.info(f"\nEarly stopping triggered after {epoch+1} epochs")
                 break
         
         # Save model at the end of training
         final_epoch = epoch
         self.save_checkpoint(final_epoch)
         print("-" * 60)
-        print(f"Training completed. Best Test Loss: {self.best_test_loss:.6f}")
+        logger.info(f"Training completed. Best Test Loss: {self.best_test_loss:.6f}")
         if self.checkpoint_dir is not None:
-            print(f"Final model saved to {self.checkpoint_dir / 'final_model.pt'}")
+            logger.info(f"Final model saved to {self.checkpoint_dir / 'final_model.pt'}")
         
         if self.logger is not None:
             final_train_loss = self.history['train_loss'][-1]

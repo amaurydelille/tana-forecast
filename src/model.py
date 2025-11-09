@@ -226,10 +226,9 @@ class MultiHeadCausalSelfAttention(nn.Module):
 
         attention_scores = (q @ k.transpose(-2, -1)) / math.sqrt(self.d_model_per_head)
 
-        mask = torch.tril(torch.ones(N, N, device=X.device)) # this function stores the mask on CPU by default.
-        mask = mask.masked_fill(mask == 0, float('-inf'))
+        mask = torch.triu(torch.ones(N, N, device=X.device, dtype=torch.bool), diagonal=1)
+        attention_scores = attention_scores.masked_fill(mask, float('-inf'))
 
-        attention_scores = attention_scores + mask
         attention_weights = F.softmax(attention_scores, dim=-1)
 
         attended = attention_weights @ v

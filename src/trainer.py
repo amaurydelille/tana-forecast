@@ -16,7 +16,7 @@ class Logger:
     def __init__(self, csv_path: str) -> None:
         self.csv_path = Path(csv_path)
         self.csv_path.parent.mkdir(parents=True, exist_ok=True)
-        self.columns = ["run_type", "dataset_name", "dataset_shape", "model_parameters", "epoch", "total_epochs", "loss_type", "training_loss", "validation_loss", "training_history", "validation_history", "timestamp"]
+        self.columns = ["run_type", "dataset_name", "dataset_shape", "model_parameters", "context_window", "prediction_length", "epoch", "total_epochs", "loss_type", "training_loss", "validation_loss", "training_history", "validation_history", "timestamp"]
         
         file_exists = self.csv_path.exists() and self.csv_path.stat().st_size > 0
         self.csv_file = open(self.csv_path, "a", newline='')
@@ -26,12 +26,14 @@ class Logger:
             self.csv_writer.writeheader()
             self.csv_file.flush()
 
-    def log(self, run_type: str = None, dataset_name: str = None, dataset_shape: Tuple[int, int, int] = None, model_parameters: int = None, epoch: int = None, total_epochs: int = None, loss_type: str = None, training_loss: float = None, validation_loss: float = None, training_history: List[float] = None, validation_history: List[float] = None, timestamp: float = None) -> None:
+    def log(self, run_type: str = None, dataset_name: str = None, dataset_shape: Tuple[int, int, int] = None, model_parameters: int = None, context_window: int = None, prediction_length: int = None, epoch: int = None, total_epochs: int = None, loss_type: str = None, training_loss: float = None, validation_loss: float = None, training_history: List[float] = None, validation_history: List[float] = None, timestamp: float = None) -> None:
         self.csv_writer.writerow({
             "run_type": run_type,
             "dataset_name": dataset_name,
             "dataset_shape": str(dataset_shape),
             "model_parameters": model_parameters,
+            "context_window": context_window,
+            "prediction_length": prediction_length,
             "epoch": epoch,
             "total_epochs": total_epochs,
             "loss_type": loss_type,
@@ -504,6 +506,8 @@ class TanaForecastTrainer:
                 dataset_name=self.dataset_name,
                 dataset_shape=dataset_shape,
                 model_parameters=num_params,
+                context_window=self.train_dataset.context_window,
+                prediction_length=self.train_dataset.prediction_length,
                 epoch=epoch + 1,  # actual number of epochs trained
                 total_epochs=self.num_epochs,
                 loss_type=self.loss_name,

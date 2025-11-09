@@ -16,7 +16,7 @@ class Logger:
     def __init__(self, csv_path: str) -> None:
         self.csv_path = Path(csv_path)
         self.csv_path.parent.mkdir(parents=True, exist_ok=True)
-        self.columns = ["run_type", "dataset_name", "dataset_shape", "model_parameters", "context_window", "prediction_length", "epoch", "total_epochs", "loss_type", "training_loss", "validation_loss", "training_history", "validation_history", "timestamp"]
+        self.columns = ["run_type", "dataset_name", "dataset_shape", "dataset_size", "model_parameters", "context_window", "prediction_length", "epoch", "total_epochs", "loss_type", "training_loss", "validation_loss", "training_history", "validation_history", "timestamp"]
         
         file_exists = self.csv_path.exists() and self.csv_path.stat().st_size > 0
         self.csv_file = open(self.csv_path, "a", newline='')
@@ -26,11 +26,12 @@ class Logger:
             self.csv_writer.writeheader()
             self.csv_file.flush()
 
-    def log(self, run_type: str = None, dataset_name: str = None, dataset_shape: Tuple[int, int, int] = None, model_parameters: int = None, context_window: int = None, prediction_length: int = None, epoch: int = None, total_epochs: int = None, loss_type: str = None, training_loss: float = None, validation_loss: float = None, training_history: List[float] = None, validation_history: List[float] = None, timestamp: float = None) -> None:
+    def log(self, run_type: str = None, dataset_name: str = None, dataset_shape: Tuple[int, int, int] = None, dataset_size: int = None, model_parameters: int = None, context_window: int = None, prediction_length: int = None, epoch: int = None, total_epochs: int = None, loss_type: str = None, training_loss: float = None, validation_loss: float = None, training_history: List[float] = None, validation_history: List[float] = None, timestamp: float = None) -> None:
         self.csv_writer.writerow({
             "run_type": run_type,
             "dataset_name": dataset_name,
             "dataset_shape": str(dataset_shape),
+            "dataset_size": dataset_size,
             "model_parameters": model_parameters,
             "context_window": context_window,
             "prediction_length": prediction_length,
@@ -62,6 +63,7 @@ class TimeSeriesDataset(Dataset):
         prediction_length: int,
         target_columns: Optional[List[str]] = None,
         feature_columns: Optional[List[str]] = None,
+        timestamp_column: Optional[str] = None,
         stride: int = 1,
         normalize: bool = True,
         flatten: bool = True
@@ -88,7 +90,7 @@ class TimeSeriesDataset(Dataset):
         else:
             self.target_columns = target_columns
         
-        self.df = self._normalize_timestamp_columns(self.df, self.feature_columns)
+        self.df = self._normalize_timestamp_columns(self.df, self.feature_columns, timestamp_column)
         
         self.feature_data = self.df[self.feature_columns].values.astype(np.float32)
         self.target_data = self.df[self.target_columns].values.astype(np.float32)
@@ -130,9 +132,9 @@ class TimeSeriesDataset(Dataset):
         return df
     
     @staticmethod
-    def _normalize_timestamp_columns(df: pd.DataFrame, feature_columns: List[str]) -> pd.DataFrame:
+    def _normalize_timestamp_columns(df: pd.DataFrame, feature_columns: List[str], timestamp_column: Optional[str] = None) -> pd.DataFrame:
         """
-        Automatically detect and normalize timestamp columns in the dataframe.
+        Normalize timestamp columns in the dataframe. Only normalizes the specified timestamp_column.
         
         Handles:
         - pandas datetime columns
@@ -142,39 +144,43 @@ class TimeSeriesDataset(Dataset):
         
         Args:
             df: Input dataframe
-            feature_columns: List of feature column names to check
+            feature_columns: List of feature column names (not used when timestamp_column is specified)
+            timestamp_column: Name of the timestamp column to normalize. If None, no normalization is performed.
         
         Returns:
-            DataFrame with timestamp columns normalized to numeric values (days since 1970-01-01)
+            DataFrame with timestamp column normalized to numeric values (days since 1970-01-01)
         """
         df = df.copy()
         
-        for col in feature_columns:
-            if col not in df.columns:
-                continue
-            
-            col_data = df[col]
-            
-            if isinstance(col_data.iloc[0] if len(col_data) > 0 else None, torch.Tensor):
-                tensor_timestamps = torch.stack([x if isinstance(x, torch.Tensor) else torch.tensor(x) for x in col_data.values])
-                normalized = universal_timestamp_normalized(tensor_timestamps, device="cpu")
-                df[col] = normalized.numpy()
-            elif pd.api.types.is_datetime64_any_dtype(col_data):
-                normalized = universal_timestamp_normalized(col_data, device="cpu")
-                df[col] = normalized.numpy()
-            elif col_data.dtype == 'object':
-                try:
-                    test_val = col_data.iloc[0] if len(col_data) > 0 else None
-                    if test_val is not None:
-                        if isinstance(test_val, (torch.Tensor, np.ndarray)):
-                            normalized = universal_timestamp_normalized(col_data.values, device="cpu")
-                            df[col] = normalized.numpy()
-                        else:
-                            pd.to_datetime(col_data.iloc[:5])
-                            normalized = universal_timestamp_normalized(col_data, device="cpu")
-                            df[col] = normalized.numpy()
-                except (ValueError, TypeError, AttributeError):
-                    pass
+        # Only normalize the specified timestamp_column
+        if timestamp_column is None:
+            return df
+        
+        if timestamp_column not in df.columns:
+            return df
+        
+        col_data = df[timestamp_column]
+                
+        if isinstance(col_data.iloc[0] if len(col_data) > 0 else None, torch.Tensor):
+            tensor_timestamps = torch.stack([x if isinstance(x, torch.Tensor) else torch.tensor(x) for x in col_data.values])
+            normalized = universal_timestamp_normalized(tensor_timestamps, device="cpu")
+            df[timestamp_column] = normalized.numpy()
+        elif pd.api.types.is_datetime64_any_dtype(col_data):
+            normalized = universal_timestamp_normalized(col_data, device="cpu")
+            df[timestamp_column] = normalized.numpy()
+        elif col_data.dtype == 'object':
+            try:
+                test_val = col_data.iloc[0] if len(col_data) > 0 else None
+                if test_val is not None:
+                    if isinstance(test_val, (torch.Tensor, np.ndarray)):
+                        normalized = universal_timestamp_normalized(col_data.values, device="cpu")
+                        df[timestamp_column] = normalized.numpy()
+                    else:
+                        pd.to_datetime(col_data.iloc[:5])
+                        normalized = universal_timestamp_normalized(col_data, device="cpu")
+                        df[timestamp_column] = normalized.numpy()
+            except (ValueError, TypeError, AttributeError):
+                pass
         
         return df
     
@@ -219,15 +225,14 @@ class TanaForecastTrainer:
         self,
         model: nn.Module,
         train_dataset: TimeSeriesDataset,
-        val_dataset: Optional[TimeSeriesDataset] = None,
+        test_dataset: Optional[TimeSeriesDataset] = None,
         batch_size: int = 32,
         learning_rate: float = 1e-3,
         weight_decay: float = 1e-5,
         num_epochs: int = 100,
-        device: str = "cuda" if torch.cuda.is_available() else "cpu",
+        device: str = "mps" if torch.backends.mps.is_available() else "cpu",
         checkpoint_dir: Optional[str] = None,
         early_stopping_patience: int = -1,
-        logger: Optional[Logger] = None,
         dataset_name: str = "unknown",
         loss_fn: Optional[callable] = None,
         loss_name: str = "MSE",
@@ -246,7 +251,7 @@ class TanaForecastTrainer:
             raise ValueError(f"Dataset {dataset_name} already exists in logs. Set allow_rerun=True to overwrite.")
 
         self.train_dataset = train_dataset
-        self.val_dataset = val_dataset
+        self.test_dataset = test_dataset
         self.allow_rerun = allow_rerun
         self.loss_name = loss_name
         self.loss_kwargs = loss_kwargs or {}
@@ -261,17 +266,16 @@ class TanaForecastTrainer:
             batch_size=batch_size,
             shuffle=True,
             num_workers=0,
-            pin_memory=True if device == "cuda" else False
+            pin_memory=True if device == "mps" else False
         )
         
-        self.val_loader = None
-        if val_dataset is not None:
-            self.val_loader = DataLoader(
-                val_dataset,
+        if test_dataset is not None:
+            self.test_loader = DataLoader(
+                test_dataset,
                 batch_size=batch_size,
                 shuffle=False,
                 num_workers=0,
-                pin_memory=True if device == "cuda" else False
+                pin_memory=True
             )
         
         self.optimizer = AdamW(
@@ -292,11 +296,11 @@ class TanaForecastTrainer:
         
         self.history = {
             'train_loss': [],
-            'val_loss': [],
+            'test_loss': [],
             'learning_rates': []
         }
         
-        self.best_val_loss = float('inf')
+        self.best_test_loss = float('inf')
         self.epochs_without_improvement = 0
 
     
@@ -355,7 +359,7 @@ class TanaForecastTrainer:
         return total_loss / num_batches
     
     def validate(self) -> float:
-        if self.val_loader is None:
+        if self.test_loader is None:
             return 0.0
         
         self.model.eval()
@@ -363,7 +367,7 @@ class TanaForecastTrainer:
         num_batches = 0
         
         with torch.no_grad():
-            for context, target in self.val_loader:
+            for context, target in self.test_loader:
                 context = context.to(self.device)
                 target = target.to(self.device)
                 
@@ -400,7 +404,7 @@ class TanaForecastTrainer:
             'model_state_dict': self.model.state_dict(),
             'optimizer_state_dict': self.optimizer.state_dict(),
             'scheduler_state_dict': self.scheduler.state_dict(),
-            'best_val_loss': self.best_val_loss,
+            'best_test_loss': self.best_test_loss,
             'history': self.history
         }
         
@@ -416,8 +420,26 @@ class TanaForecastTrainer:
         self.model.load_state_dict(checkpoint['model_state_dict'])
         self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-        self.best_val_loss = checkpoint['best_val_loss']
-        self.history = checkpoint['history']
+        # Handle both 'best_val_loss' and 'best_test_loss' for backwards compatibility
+        if 'best_test_loss' in checkpoint:
+            self.best_test_loss = checkpoint['best_test_loss']
+        elif 'best_val_loss' in checkpoint:
+            self.best_test_loss = checkpoint['best_val_loss']
+        else:
+            self.best_test_loss = float('inf')
+        # Handle history keys for backwards compatibility
+        if 'history' in checkpoint:
+            history = checkpoint['history']
+            # Convert 'val_loss' to 'test_loss' if needed
+            if 'val_loss' in history and 'test_loss' not in history:
+                history['test_loss'] = history.pop('val_loss')
+            self.history = history
+        else:
+            self.history = {
+                'train_loss': [],
+                'test_loss': [],
+                'learning_rates': []
+            }
         return checkpoint['epoch']
     
     def find_latest_checkpoint(self) -> Optional[str]:
@@ -452,36 +474,36 @@ class TanaForecastTrainer:
         print(f"Starting from epoch: {start_epoch + 1}")
         print(f"Batch size: {self.train_loader.batch_size}")
         print(f"Train batches: {len(self.train_loader)}")
-        if self.val_loader:
-            print(f"Val batches: {len(self.val_loader)}")
+        if self.test_loader:
+            print(f"Test batches: {len(self.test_loader)}")
         print("-" * 60)
         
         for epoch in range(start_epoch, self.num_epochs):
             start_time = time.time()
             
             train_loss = self.train_epoch()
-            val_loss = self.validate()
+            test_loss = self.validate()
             
             self.scheduler.step()
             current_lr = self.optimizer.param_groups[0]['lr']
             
             self.history['train_loss'].append(train_loss)
-            self.history['val_loss'].append(val_loss)
+            self.history['test_loss'].append(test_loss)
             self.history['learning_rates'].append(current_lr)
             
             epoch_time = time.time() - start_time
             
             print(f"Epoch {epoch+1}/{self.num_epochs} | "
                   f"Train Loss: {train_loss:.6f} | "
-                  f"Val Loss: {val_loss:.6f} | "
+                  f"Test Loss: {test_loss:.6f} | "
                   f"LR: {current_lr:.2e} | "
                   f"Time: {epoch_time:.2f}s")
             
-            if val_loss < self.best_val_loss:
-                self.best_val_loss = val_loss
+            if test_loss < self.best_test_loss:
+                self.best_test_loss = test_loss
                 self.epochs_without_improvement = 0
                 self.save_checkpoint(epoch, is_best=True)
-                print(f"  → New best model saved (Val Loss: {val_loss:.6f})")
+                print(f"  → New best model saved (Test Loss: {test_loss:.6f})")
             else:
                 self.epochs_without_improvement += 1
             
@@ -492,29 +514,30 @@ class TanaForecastTrainer:
                 break
         
         print("-" * 60)
-        print(f"Training completed. Best Val Loss: {self.best_val_loss:.6f}")
+        print(f"Training completed. Best Test Loss: {self.best_test_loss:.6f}")
         
-        # Log the final summary if logger is provided
         if self.logger is not None:
             final_train_loss = self.history['train_loss'][-1]
-            final_val_loss = self.history['val_loss'][-1] if self.history['val_loss'] else 0.0
+            final_test_loss = self.history['test_loss'][-1] if self.history['test_loss'] else 0.0
             num_params = self.count_parameters(self.model)
             dataset_shape = self.get_dataset_shape()
             
+            # CSV for now but we might want to use a proper db instead
             self.logger.log(
                 run_type='training',
                 dataset_name=self.dataset_name,
                 dataset_shape=dataset_shape,
+                dataset_size=self.train_dataset.df.memory_usage().sum(),
                 model_parameters=num_params,
                 context_window=self.train_dataset.context_window,
                 prediction_length=self.train_dataset.prediction_length,
-                epoch=epoch + 1,  # actual number of epochs trained
+                epoch=epoch + 1,
                 total_epochs=self.num_epochs,
                 loss_type=self.loss_name,
                 training_loss=final_train_loss,
-                validation_loss=final_val_loss,
+                validation_loss=final_test_loss,
                 training_history=self.history['train_loss'],
-                validation_history=self.history['val_loss'],
+                validation_history=self.history['test_loss'],
             )
             print(f"Training run logged to {self.logger.csv_path}")
         

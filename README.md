@@ -1,5 +1,5 @@
 # Tana Forecast
-A decoded only time-series foundation model trained to outperformed current other time-series SOTA models.
+A decoded only time-series foundation model trained to outperform current other time-series SOTA models.
 
 ## Current Status
 

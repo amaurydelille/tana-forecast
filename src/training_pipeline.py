@@ -22,14 +22,15 @@ class RunDatasetTraining:
         context_window: int,
         prediction_length: int,
         feature_columns: List[str],
-        target_columns: List[str]
+        target_columns: List[str],
+        timestamp_column: str
     ) -> None:
         self.dataset_name = dataset_name
         self.train_dataset = train_dataset
         self.test_dataset = test_dataset
         self.context_window = context_window
         self.prediction_length = prediction_length
-
+        self.timestamp_column = timestamp_column
         self.train_dataset = TimeSeriesDataset(
             df=self.train_dataset,
             context_window=self.context_window,
@@ -37,7 +38,8 @@ class RunDatasetTraining:
             stride=1,
             normalize=True,
             feature_columns=self.feature_columns,
-            target_columns=self.target_columns
+            target_columns=self.target_columns,
+            timestamp_column=self.timestamp_column
         )
 
         self.test_dataset = TimeSeriesDataset(
@@ -47,7 +49,8 @@ class RunDatasetTraining:
             stride=1,
             normalize=True,
             feature_columns=self.feature_columns,
-            target_columns=self.target_columns
+            target_columns=self.target_columns,
+            timestamp_column=self.timestamp_column
         )
 
         self.model = TanaForecast(

@@ -16,7 +16,7 @@ def plot_training_history(history: Dict[str, List[float]], height: int = 500, wi
         row=1, col=1
     )
     fig.add_trace(
-        go.Scatter(y=history['val_loss'], name='Val Loss', mode='lines'),
+        go.Scatter(y=history['test_loss'], name='Test Loss', mode='lines'),
         row=1, col=1
     )
     

@@ -11,6 +11,7 @@ import time
 import csv
 from src.utils import TimeStamps
 import logging
+import re
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -249,6 +250,7 @@ class TanaForecastTrainer:
         self.early_stopping_patience = early_stopping_patience
         self.logger = Logger(csv_path='/Users/amaurydelille/Documents/projects/tana-forecast/src/logs/training_logs.csv')
         self.dataset_name = dataset_name
+        self.dataset_id = self._sanitize_name(dataset_name)
 
         logs = pd.read_csv(self.logger.csv_path)
         if dataset_name in logs['dataset_name'].values and not allow_rerun:
@@ -296,9 +298,12 @@ class TanaForecastTrainer:
             eta_min=learning_rate * 0.01
         )
         
-        self.checkpoint_dir = Path(checkpoint_dir) if checkpoint_dir else None
-        if self.checkpoint_dir:
+        if checkpoint_dir:
+            base_checkpoint_dir = Path(checkpoint_dir)
+            self.checkpoint_dir = base_checkpoint_dir / self.dataset_id
             self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        else:
+            self.checkpoint_dir = None
         
         self.history = {
             'train_loss': [],
@@ -309,6 +314,13 @@ class TanaForecastTrainer:
         self.best_test_loss = float('inf')
         self.epochs_without_improvement = 0
 
+    
+    @staticmethod
+    def _sanitize_name(name: str) -> str:
+        sanitized = re.sub(r'[^A-Za-z0-9_.-]+', '_', name.strip())
+        if not sanitized:
+            return "dataset"
+        return sanitized
     
     @staticmethod
     def count_parameters(model: nn.Module) -> int:
@@ -325,7 +337,8 @@ class TanaForecastTrainer:
         num_features, context_window = context.shape
         return (num_samples, num_features, context_window)
         
-    def train_epoch(self) -> float:
+    def train_epoch(self, epoch: int) -> float:
+        logger.info(f"Training epoch {epoch + 1}/{self.num_epochs}")
         self.model.train()
         total_loss = 0.0
         num_batches = 0
@@ -361,29 +374,12 @@ class TanaForecastTrainer:
             self.optimizer.step()
             
             total_loss += loss.item()
-
-            if self.logger is not None:
-                self.logger.log(
-                    run_type='training',
-                    dataset_name=f"{self.dataset_name}_batch_{num_batches}_of_{len(self.train_loader)}",
-                    dataset_shape=self.get_dataset_shape(),
-                    dataset_size=self.train_dataset.df.memory_usage().sum(),
-                    model_parameters=self.count_parameters(self.model),
-                    context_window=self.train_dataset.context_window,
-                    prediction_length=self.train_dataset.prediction_length,
-                    epoch=self.epoch + 1,
-                    total_epochs=self.num_epochs,
-                    loss_type=self.loss_name,
-                    training_loss=loss.item(),
-                    validation_loss=0.0,
-                    training_history=self.history['train_loss'] + [loss.item()],
-                    validation_history=self.history['test_loss'] + [0.0]
-            )
-            print(f"Training run logged to {self.logger.csv_path}")
             
             num_batches += 1
+            self.save_checkpoint(epoch, batch_idx=num_batches)
             logger.info(f"Train batch {num_batches}/{len(self.train_loader)} loss: {loss.item()} in {time.time() - start_time:.2f}s")
         
+        self.save_checkpoint(epoch, batch_idx=len(self.train_loader))
         return total_loss / num_batches
     
     def validate(self) -> float:
@@ -423,7 +419,7 @@ class TanaForecastTrainer:
         
         return total_loss / num_batches
     
-    def save_checkpoint(self, epoch: int) -> None:
+    def save_checkpoint(self, epoch: int, batch_idx: Optional[int] = None) -> None:
         """Save model checkpoint at the end of training."""
         if self.checkpoint_dir is None:
             return
@@ -437,8 +433,14 @@ class TanaForecastTrainer:
             'history': self.history
         }
         
-        path = self.checkpoint_dir / 'final_model.pt'
-        torch.save(checkpoint, path)
+        # Always maintain/update dataset-specific final checkpoint for resume.
+        final_path = self.checkpoint_dir / 'final_model.pt'
+        torch.save(checkpoint, final_path)
+
+        suffix = f"batch_{batch_idx}" if batch_idx is not None else "epoch_end"
+        detailed_filename = f"{self.dataset_id}_epoch_{epoch + 1}_{suffix}.pt"
+        detailed_path = self.checkpoint_dir / detailed_filename
+        torch.save(checkpoint, detailed_path)
     
     def load_checkpoint(self, checkpoint_path: str) -> int:
         checkpoint = torch.load(checkpoint_path, map_location=self.device)
@@ -526,7 +528,7 @@ class TanaForecastTrainer:
         for epoch in range(start_epoch, self.num_epochs):
             start_time = time.time()
             
-            train_loss = self.train_epoch()
+            train_loss = self.train_epoch(epoch)
             test_loss = self.validate()
             
             self.scheduler.step()
@@ -553,11 +555,29 @@ class TanaForecastTrainer:
             if self.early_stopping_patience != -1 and self.epochs_without_improvement >= self.early_stopping_patience:
                 logger.info(f"\nEarly stopping triggered after {epoch+1} epochs")
                 break
-        
-        # Save model at the end of training
-        final_epoch = epoch
-        self.save_checkpoint(final_epoch)
+
         print("-" * 60)
+
+
+        if self.logger is not None:
+            self.logger.log(
+                run_type='training',
+                dataset_name=f"{self.dataset_name}_epoch_{self.num_epochs}_batches_{len(self.train_loader)}",
+                dataset_shape=self.get_dataset_shape(),
+                dataset_size=self.train_dataset.df.memory_usage().sum(),
+                model_parameters=self.count_parameters(self.model),
+                context_window=self.train_dataset.context_window,
+                prediction_length=self.train_dataset.prediction_length,
+                epoch=self.num_epochs,
+                total_epochs=self.num_epochs,
+                loss_type=self.loss_name,
+                training_loss=self.history['train_loss'][-1],
+                validation_loss=self.history['test_loss'][-1],
+                training_history=self.history['train_loss'],
+                validation_history=self.history['test_loss']
+            )
+            print(f"Training run logged to {self.logger.csv_path}")
+
         logger.info(f"Training completed. Best Test Loss: {self.best_test_loss:.6f}")
         if self.checkpoint_dir is not None:
             logger.info(f"Final model saved to {self.checkpoint_dir / 'final_model.pt'}")

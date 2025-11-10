@@ -361,6 +361,26 @@ class TanaForecastTrainer:
             self.optimizer.step()
             
             total_loss += loss.item()
+
+            if self.logger is not None:
+                self.logger.log(
+                    run_type='training',
+                    dataset_name=f"{self.dataset_name}_batch_{num_batches}_of_{len(self.train_loader)}",
+                    dataset_shape=self.get_dataset_shape(),
+                    dataset_size=self.train_dataset.df.memory_usage().sum(),
+                    model_parameters=self.count_parameters(self.model),
+                    context_window=self.train_dataset.context_window,
+                    prediction_length=self.train_dataset.prediction_length,
+                    epoch=self.epoch + 1,
+                    total_epochs=self.num_epochs,
+                    loss_type=self.loss_name,
+                    training_loss=loss.item(),
+                    validation_loss=0.0,
+                    training_history=self.history['train_loss'] + [loss.item()],
+                    validation_history=self.history['test_loss'] + [0.0]
+            )
+            print(f"Training run logged to {self.logger.csv_path}")
+            
             num_batches += 1
             logger.info(f"Train batch {num_batches}/{len(self.train_loader)} loss: {loss.item()} in {time.time() - start_time:.2f}s")
         
@@ -541,31 +561,6 @@ class TanaForecastTrainer:
         logger.info(f"Training completed. Best Test Loss: {self.best_test_loss:.6f}")
         if self.checkpoint_dir is not None:
             logger.info(f"Final model saved to {self.checkpoint_dir / 'final_model.pt'}")
-        
-        if self.logger is not None:
-            final_train_loss = self.history['train_loss'][-1]
-            final_test_loss = self.history['test_loss'][-1] if self.history['test_loss'] else 0.0
-            num_params = self.count_parameters(self.model)
-            dataset_shape = self.get_dataset_shape()
-            
-            # CSV for now but we might want to use a proper db instead
-            self.logger.log(
-                run_type='training',
-                dataset_name=self.dataset_name,
-                dataset_shape=dataset_shape,
-                dataset_size=self.train_dataset.df.memory_usage().sum(),
-                model_parameters=num_params,
-                context_window=self.train_dataset.context_window,
-                prediction_length=self.train_dataset.prediction_length,
-                epoch=epoch + 1,
-                total_epochs=self.num_epochs,
-                loss_type=self.loss_name,
-                training_loss=final_train_loss,
-                validation_loss=final_test_loss,
-                training_history=self.history['train_loss'],
-                validation_history=self.history['test_loss'],
-            )
-            print(f"Training run logged to {self.logger.csv_path}")
         
         return self.history
     

@@ -162,12 +162,15 @@ class MultiHeadCausalSelfAttention(nn.Module):
 class FeedForward(nn.Module):
     def __init__(self, d_model: int, d_ff: int = 2048) -> None:
         super().__init__()
-        self.fc1 = nn.Linear(in_features=d_model, out_features=d_ff)
-        self.dropout = nn.Dropout(p=0.2)
-        self.fc2 = nn.Linear(in_features=d_ff, out_features=d_model)
+        self.model = nn.Sequential(
+            nn.Linear(in_features=d_model, out_features=d_ff),
+            nn.ReLU(),
+            nn.Dropout(p=0.2),
+            nn.Linear(in_features=d_ff, out_features=d_model)
+        )
 
     def forward(self, X: torch.Tensor) -> torch.Tensor:
-        return self.fc2(self.dropout(self.fc1(X)))
+        return self.model(X)
 
 class MixtureOfExpert(nn.Module):
     def __init__(

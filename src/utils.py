@@ -104,14 +104,20 @@ class Loss:
         - r_i is the average router probability for expert i
         
         Args:
-            router_probs: [batch_size, seq_len, n_experts] - softmax probabilities
-            expert_indices: [batch_size, seq_len, top_k] - selected expert indices
+            router_probs: [batch_size, seq_len, n_experts] (or with n_decoders dim)
+            expert_indices: [batch_size, seq_len, top_k] (or with n_decoders dim)
             n_experts: int - total number of experts (N)
             top_k: int - number of experts selected per step (K)
         
         Returns:
             aux_loss: scalar tensor
         """
+        if router_probs.dim() == 4:
+            # Shape: [n_decoders, batch_size, seq_len, n_experts]
+            # Collapse decoders into batch dimension
+            router_probs = router_probs.view(-1, router_probs.size(2), router_probs.size(3))
+            expert_indices = expert_indices.view(-1, expert_indices.size(2), expert_indices.size(3))
+
         batch_size, T, _ = router_probs.shape
         
         # r_i: average router probability for each expert across all positions

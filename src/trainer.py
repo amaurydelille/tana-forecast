@@ -5,60 +5,325 @@ from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
 import pandas as pd
 import numpy as np
-from typing import Optional, List, Tuple, Dict
+from typing import Optional, List, Tuple, Dict, Any
 from pathlib import Path
 import time
 import csv
 from src.utils import TimeStamps
 import logging
 import re
+import json
+from datetime import datetime
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-class Logger:
-    """Log training runs into CSV files"""
-    def __init__(self, csv_path: str) -> None:
-        self.csv_path = Path(csv_path)
-        self.csv_path.parent.mkdir(parents=True, exist_ok=True)
-        self.columns = ["run_type", "dataset_name", "dataset_shape", "dataset_size", "model_parameters", "context_window", "prediction_length", "epoch", "total_epochs", "loss_type", "training_loss", "validation_loss", "training_history", "validation_history", "timestamp"]
-        
-        file_exists = self.csv_path.exists() and self.csv_path.stat().st_size > 0
-        self.csv_file = open(self.csv_path, "a", newline='')
-        self.csv_writer = csv.DictWriter(self.csv_file, fieldnames=self.columns)
-        
-        if not file_exists:
-            self.csv_writer.writeheader()
-            self.csv_file.flush()
 
-    def log(self, run_type: str = None, dataset_name: str = None, dataset_shape: Tuple[int, int, int] = None, dataset_size: int = None, model_parameters: int = None, context_window: int = None, prediction_length: int = None, epoch: int = None, total_epochs: int = None, loss_type: str = None, training_loss: float = None, validation_loss: float = None, training_history: List[float] = None, validation_history: List[float] = None, timestamp: float = None) -> None:
-        self.csv_writer.writerow({
-            "run_type": run_type,
-            "dataset_name": dataset_name,
-            "dataset_shape": str(dataset_shape),
-            "dataset_size": dataset_size,
-            "model_parameters": model_parameters,
-            "context_window": context_window,
-            "prediction_length": prediction_length,
-            "epoch": epoch,
-            "total_epochs": total_epochs,
-            "loss_type": loss_type,
-            "training_loss": training_loss,
-            "validation_loss": validation_loss,
-            "training_history": str(training_history),
-            "validation_history": str(validation_history),
-            "timestamp": timestamp if timestamp is not None else time.time()
-        })
-        self.csv_file.flush()
+class CheckpointManager:
+    """
+    Professional checkpoint management system with versioning and metadata.
     
-    def close(self) -> None:
-        """Close the CSV file"""
-        if self.csv_file and not self.csv_file.closed:
-            self.csv_file.close()
+    Features:
+    - Unique checkpoint identification per dataset/run
+    - Metadata tracking (hyperparameters, dataset info, timestamps)
+    - Smart resume logic based on training state
+    - Checkpoint versioning and cleanup
+    """
     
-    def __del__(self) -> None:
-        """Ensure file is closed when Logger is destroyed"""
-        self.close()
+    def __init__(
+        self,
+        checkpoint_dir: Path,
+        dataset_name: str,
+        run_id: Optional[str] = None,
+        keep_last_n: int = 3
+    ):
+        """
+        Args:
+            checkpoint_dir: Base directory for all checkpoints
+            dataset_name: Name of the dataset being trained
+            run_id: Optional unique run identifier (auto-generated if None)
+            keep_last_n: Number of checkpoint versions to keep (-1 for all)
+        """
+        self.base_dir = Path(checkpoint_dir)
+        self.dataset_name = self._sanitize_name(dataset_name)
+        self.run_id = run_id or datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.keep_last_n = keep_last_n
+        
+        # Create directory structure: checkpoints/{dataset_name}/{run_id}/
+        self.run_dir = self.base_dir / self.dataset_name / self.run_id
+        self.run_dir.mkdir(parents=True, exist_ok=True)
+        
+        self.metadata_path = self.run_dir / "metadata.json"
+        self.best_checkpoint_path = self.run_dir / "best_model.pt"
+        self.last_checkpoint_path = self.run_dir / "last_model.pt"
+        
+        logger.info(f"CheckpointManager initialized for '{dataset_name}' (run_id: {self.run_id})")
+        logger.info(f"Checkpoint directory: {self.run_dir}")
+    
+    @staticmethod
+    def _sanitize_name(name: str) -> str:
+        """Sanitize names for filesystem compatibility."""
+        sanitized = re.sub(r'[^A-Za-z0-9_.-]+', '_', name.strip())
+        return sanitized if sanitized else "dataset"
+    
+    def save_checkpoint(
+        self,
+        epoch: int,
+        model_state: Dict,
+        optimizer_state: Dict,
+        scheduler_state: Dict,
+        metrics: Dict[str, float],
+        metadata: Optional[Dict[str, Any]] = None,
+        is_best: bool = False
+    ) -> None:
+        """
+        Save a checkpoint with full state and metadata.
+        
+        Args:
+            epoch: Current epoch number
+            model_state: Model state dict
+            optimizer_state: Optimizer state dict
+            scheduler_state: Scheduler state dict
+            metrics: Dictionary of metric values (train_loss, val_loss, etc.)
+            metadata: Additional metadata to store
+            is_best: Whether this is the best model so far
+        """
+        checkpoint = {
+            'epoch': epoch,
+            'model_state_dict': model_state,
+            'optimizer_state_dict': optimizer_state,
+            'scheduler_state_dict': scheduler_state,
+            'metrics': metrics,
+            'metadata': metadata or {},
+            'timestamp': time.time(),
+            'run_id': self.run_id,
+            'dataset_name': self.dataset_name
+        }
+        
+        torch.save(checkpoint, self.last_checkpoint_path)
+        
+        if is_best:
+            torch.save(checkpoint, self.best_checkpoint_path)
+            logger.info(f"New best checkpoint saved (epoch {epoch + 1})")
+        
+        self._update_metadata(epoch, metrics, metadata)
+        
+        if self.keep_last_n > 0:
+            self._cleanup_old_checkpoints()
+    
+    def load_checkpoint(
+        self,
+        checkpoint_type: str = "last"
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Load a checkpoint.
+        
+        Args:
+            checkpoint_type: "last", "best", or path to specific checkpoint
+            
+        Returns:
+            Checkpoint dictionary or None if not found
+        """
+        if checkpoint_type == "last":
+            checkpoint_path = self.last_checkpoint_path
+        elif checkpoint_type == "best":
+            checkpoint_path = self.best_checkpoint_path
+        else:
+            checkpoint_path = Path(checkpoint_type)
+        
+        if not checkpoint_path.exists():
+            logger.info(f"No checkpoint found at {checkpoint_path}")
+            return None
+        
+        logger.info(f"Loading checkpoint from {checkpoint_path}")
+        checkpoint = torch.load(checkpoint_path, map_location='cpu')
+        
+        logger.info(f"Checkpoint loaded: epoch {checkpoint['epoch'] + 1}, "
+                   f"metrics: {checkpoint.get('metrics', {})}")
+        
+        return checkpoint
+    
+    def list_checkpoints(self) -> List[Path]:
+        """List all available checkpoints for this run."""
+        checkpoints = sorted(self.run_dir.glob("checkpoint_epoch_*.pt"))
+        return checkpoints
+    
+    def _update_metadata(
+        self,
+        epoch: int,
+        metrics: Dict[str, float],
+        additional_metadata: Optional[Dict] = None
+    ) -> None:
+        """Update or create metadata file."""
+        if self.metadata_path.exists():
+            with open(self.metadata_path, 'r') as f:
+                metadata = json.load(f)
+        else:
+            metadata = {
+                'dataset_name': self.dataset_name,
+                'run_id': self.run_id,
+                'created_at': datetime.now().isoformat(),
+                'epochs': []
+            }
+        
+        epoch_info = {
+            'epoch': epoch + 1,
+            'metrics': metrics,
+            'timestamp': datetime.now().isoformat()
+        }
+        
+        if additional_metadata:
+            epoch_info.update(additional_metadata)
+        
+        metadata['epochs'].append(epoch_info)
+        metadata['last_updated'] = datetime.now().isoformat()
+        metadata['total_epochs'] = epoch + 1
+        
+        with open(self.metadata_path, 'w') as f:
+            json.dump(metadata, f, indent=2)
+    
+    def _cleanup_old_checkpoints(self) -> None:
+        """Remove old checkpoints, keeping only the last N."""
+        checkpoints = self.list_checkpoints()
+        
+        if len(checkpoints) > self.keep_last_n:
+            to_remove = checkpoints[:-self.keep_last_n]
+            for ckpt_path in to_remove:
+                ckpt_path.unlink()
+                logger.debug(f"Removed old checkpoint: {ckpt_path.name}")
+    
+    def get_latest_run_id(
+        base_dir: Path,
+        dataset_name: str
+    ) -> Optional[str]:
+        """Get the latest run_id for a dataset (for resuming)."""
+        dataset_dir = base_dir / CheckpointManager._sanitize_name(dataset_name)
+        
+        if not dataset_dir.exists():
+            return None
+        
+        run_dirs = [d for d in dataset_dir.iterdir() if d.is_dir()]
+        
+        if not run_dirs:
+            return None
+        
+        latest_run = max(run_dirs, key=lambda p: p.stat().st_mtime)
+        return latest_run.name
+
+
+class TrainingLogger:
+    def __init__(
+        self,
+        log_dir: Path,
+        dataset_name: str,
+        run_id: str,
+        context_window: int,
+        prediction_length: int,
+        batch_size: int,
+    ):
+        self.log_dir = Path(log_dir)
+        self.log_dir.mkdir(parents=True, exist_ok=True)
+        
+        self.dataset_name = dataset_name
+        self.run_id = run_id
+        self.context_window = context_window
+        self.prediction_length = prediction_length
+        self.batch_size = batch_size
+        
+        sanitized_name = re.sub(r'[^A-Za-z0-9_.-]+', '_', dataset_name)
+        self.log_file = self.log_dir / f"{sanitized_name}_{run_id}.csv"
+        
+        self.columns = [
+            'run_id',
+            'dataset_name',
+            'context_window',
+            'prediction_length',
+            'batch_size',
+            'epoch',
+            'train_loss',
+            'val_loss',
+            'learning_rate',
+            'epoch_time_sec',
+            'total_time_sec',
+            'best_val_loss',
+            'timestamp',
+            'date'
+        ]
+        
+        self._initialize_log_file()
+        self.start_time = time.time()
+        
+        logger.info(f"TrainingLogger initialized: {self.log_file}")
+    
+    def _initialize_log_file(self) -> None:
+        """Create log file with headers if it doesn't exist."""
+        if not self.log_file.exists():
+            with open(self.log_file, 'w', newline='') as f:
+                writer = csv.DictWriter(f, fieldnames=self.columns)
+                writer.writeheader()
+    
+    def log_epoch(
+        self,
+        epoch: int,
+        train_loss: float,
+        val_loss: float,
+        learning_rate: float,
+        epoch_time: float,
+        best_val_loss: float
+    ) -> None:
+        """
+        Log a single epoch's metrics.
+        
+        Args:
+            epoch: Current epoch number (0-indexed)
+            train_loss: Training loss
+            val_loss: Validation loss
+            learning_rate: Current learning rate
+            epoch_time: Time taken for this epoch (seconds)
+            best_val_loss: Best validation loss so far
+        """
+        total_time = time.time() - self.start_time
+        timestamp = time.time()
+        date = datetime.fromtimestamp(timestamp).isoformat()
+        
+        row = {
+            'run_id': self.run_id,
+            'dataset_name': self.dataset_name,
+            'context_window': self.context_window,
+            'prediction_length': self.prediction_length,
+            'batch_size': self.batch_size,
+            'epoch': epoch + 1,
+            'train_loss': f"{train_loss:.6f}",
+            'val_loss': f"{val_loss:.6f}",
+            'learning_rate': f"{learning_rate:.2e}",
+            'epoch_time_sec': f"{epoch_time:.2f}",
+            'total_time_sec': f"{total_time:.2f}",
+            'best_val_loss': f"{best_val_loss:.6f}",
+            'timestamp': timestamp,
+            'date': date
+        }
+        
+        with open(self.log_file, 'a', newline='') as f:
+            writer = csv.DictWriter(f, fieldnames=self.columns)
+            writer.writerow(row)
+    
+    def log_summary(self, summary_data: Dict[str, Any]) -> None:
+        """
+        Log a summary of the entire training run.
+        
+        Args:
+            summary_data: Dictionary containing summary statistics
+        """
+        summary_file = self.log_dir / f"{self.dataset_name}_{self.run_id}_summary.json"
+        
+        summary_data['timestamp'] = datetime.now().isoformat()
+        summary_data['run_id'] = self.run_id
+        summary_data['dataset_name'] = self.dataset_name
+        
+        with open(summary_file, 'w') as f:
+            json.dump(summary_data, f, indent=2)
+        
+        logger.info(f"Training summary saved: {summary_file}")
 
 class TimeSeriesDataset(Dataset):
     def __init__(
@@ -89,6 +354,15 @@ class TimeSeriesDataset(Dataset):
             self.feature_columns = list(self.df.columns)
         else:
             self.feature_columns = feature_columns
+        
+        numeric_feature_cols = self.df[self.feature_columns].select_dtypes(include=["number", "bool"]).columns.tolist()
+        if len(numeric_feature_cols) != len(self.feature_columns):
+            import logging
+            logging.getLogger(__name__).warning(
+                f"Dropping non-numeric feature columns: "
+                f"{set(self.feature_columns) - set(numeric_feature_cols)}"
+            )
+        self.feature_columns = numeric_feature_cols
             
         if target_columns is None:
             self.target_columns = self.feature_columns
@@ -144,8 +418,6 @@ class TimeSeriesDataset(Dataset):
         Handles:
         - pandas datetime columns
         - string timestamps
-        - torch.Tensor timestamps (from Chronos datasets)
-        - numpy array timestamps
         
         Args:
             df: Input dataframe
@@ -226,6 +498,16 @@ class TimeSeriesDataset(Dataset):
         return tensor * std + mean
 
 class TanaForecastTrainer:
+    """
+    Professional trainer for TanaForecast models with modern checkpoint and logging.
+    
+    Features:
+    - Automatic checkpoint management with versioning
+    - Structured per-epoch logging
+    - Smart resume logic
+    - Best model tracking
+    """
+    
     def __init__(
         self,
         model: nn.Module,
@@ -237,28 +519,53 @@ class TanaForecastTrainer:
         num_epochs: int = 100,
         device: str = "mps" if torch.backends.mps.is_available() else "cpu",
         checkpoint_dir: Optional[str] = None,
+        log_dir: Optional[str] = None,
         early_stopping_patience: int = -1,
         dataset_name: str = "unknown",
+        run_id: Optional[str] = None,
         loss_fn: Optional[callable] = None,
         loss_name: str = "MSE",
         loss_kwargs: Optional[Dict] = None,
-        allow_rerun: bool = False
+        keep_checkpoints: int = 3,
+        resume_from_checkpoint: bool = True
     ) -> None:
+        """
+        Args:
+            model: Model to train
+            train_dataset: Training dataset
+            test_dataset: Optional validation/test dataset
+            batch_size: Batch size for training
+            learning_rate: Initial learning rate
+            weight_decay: Weight decay for optimizer
+            num_epochs: Total number of epochs to train
+            device: Device to train on
+            checkpoint_dir: Directory to save checkpoints
+            log_dir: Directory to save training logs
+            early_stopping_patience: Patience for early stopping (-1 to disable)
+            dataset_name: Name of the dataset
+            run_id: Optional unique run identifier (auto-generated if None)
+            loss_fn: Custom loss function
+            loss_name: Name of the loss function for logging
+            loss_kwargs: Additional kwargs for loss function
+            keep_checkpoints: Number of checkpoint versions to keep
+            resume_from_checkpoint: Whether to resume from latest checkpoint
+        """
         self.model = model.to(device)
         self.device = device
         self.num_epochs = num_epochs
         self.early_stopping_patience = early_stopping_patience
-        self.logger = Logger(csv_path='/Users/amaurydelille/Documents/projects/tana-forecast/src/logs/training_logs.csv')
         self.dataset_name = dataset_name
-        self.dataset_id = self._sanitize_name(dataset_name)
-
-        logs = pd.read_csv(self.logger.csv_path)
-        if dataset_name in logs['dataset_name'].values and not allow_rerun:
-            raise ValueError(f"Dataset {dataset_name} already exists in logs. Set allow_rerun=True to overwrite.")
-
+        self.run_id = run_id
+        self.resume_from_checkpoint = resume_from_checkpoint
+        
+        self.batch_size = batch_size
+        self.learning_rate = learning_rate
+        self.weight_decay = weight_decay
+        
         self.train_dataset = train_dataset
         self.test_dataset = test_dataset
-        self.allow_rerun = allow_rerun
+        
+
         self.loss_name = loss_name
         self.loss_kwargs = loss_kwargs or {}
         if loss_fn is None:
@@ -299,28 +606,37 @@ class TanaForecastTrainer:
         )
         
         if checkpoint_dir:
-            base_checkpoint_dir = Path(checkpoint_dir)
-            self.checkpoint_dir = base_checkpoint_dir / self.dataset_id
-            self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+            self.checkpoint_manager = CheckpointManager(
+                checkpoint_dir=Path(checkpoint_dir),
+                dataset_name=dataset_name,
+                run_id=run_id,
+                keep_last_n=keep_checkpoints
+            )
+            self.run_id = self.checkpoint_manager.run_id
         else:
-            self.checkpoint_dir = None
+            self.checkpoint_manager = None
+            self.run_id = run_id or datetime.now().strftime("%Y%m%d_%H%M%S")
+        
+        if log_dir:
+            self.training_logger = TrainingLogger(
+                log_dir=Path(log_dir),
+                dataset_name=dataset_name,
+                run_id=self.run_id,
+                context_window=self.train_dataset.context_window,
+                prediction_length=self.train_dataset.prediction_length,
+                batch_size=self.batch_size,
+            )
+        else:
+            self.training_logger = None
         
         self.history = {
             'train_loss': [],
-            'test_loss': [],
+            'val_loss': [],
             'learning_rates': []
         }
-        
-        self.best_test_loss = float('inf')
+        self.best_val_loss = float('inf')
         self.epochs_without_improvement = 0
-
-    
-    @staticmethod
-    def _sanitize_name(name: str) -> str:
-        sanitized = re.sub(r'[^A-Za-z0-9_.-]+', '_', name.strip())
-        if not sanitized:
-            return "dataset"
-        return sanitized
+        self.start_epoch = 0
     
     @staticmethod
     def count_parameters(model: nn.Module) -> int:
@@ -338,11 +654,10 @@ class TanaForecastTrainer:
         return (num_samples, num_features, context_window)
         
     def train_epoch(self, epoch: int) -> float:
-        logger.info(f"Training epoch {epoch + 1}/{self.num_epochs}")
+        """Train for one epoch."""
         self.model.train()
         total_loss = 0.0
         num_batches = 0
-        start_time = time.time()
 
         for context, target in self.train_loader:
             context = context.to(self.device)
@@ -374,13 +689,9 @@ class TanaForecastTrainer:
             self.optimizer.step()
             
             total_loss += loss.item()
-            
             num_batches += 1
-            self.save_checkpoint(epoch, batch_idx=num_batches)
-            logger.info(f"Train batch {num_batches}/{len(self.train_loader)} loss: {loss.item()} in {time.time() - start_time:.2f}s")
         
-        self.save_checkpoint(epoch, batch_idx=len(self.train_loader))
-        return total_loss / num_batches
+        return total_loss / num_batches if num_batches > 0 else 0.0
     
     def validate(self) -> float:
         if self.test_loader is None:
@@ -419,168 +730,143 @@ class TanaForecastTrainer:
         
         return total_loss / num_batches
     
-    def save_checkpoint(self, epoch: int, batch_idx: Optional[int] = None) -> None:
-        """Save model checkpoint at the end of training."""
-        if self.checkpoint_dir is None:
+    def _load_checkpoint_state(self) -> None:
+        """Load checkpoint state if resume is enabled."""
+        if not self.resume_from_checkpoint or self.checkpoint_manager is None:
             return
         
-        checkpoint = {
-            'epoch': epoch,
-            'model_state_dict': self.model.state_dict(),
-            'optimizer_state_dict': self.optimizer.state_dict(),
-            'scheduler_state_dict': self.scheduler.state_dict(),
-            'best_test_loss': self.best_test_loss,
-            'history': self.history
-        }
+        checkpoint = self.checkpoint_manager.load_checkpoint("last")
+        if checkpoint is None:
+            return
         
-        # Always maintain/update dataset-specific final checkpoint for resume.
-        final_path = self.checkpoint_dir / 'final_model.pt'
-        torch.save(checkpoint, final_path)
-
-        suffix = f"batch_{batch_idx}" if batch_idx is not None else "epoch_end"
-        detailed_filename = f"{self.dataset_id}_epoch_{epoch + 1}_{suffix}.pt"
-        detailed_path = self.checkpoint_dir / detailed_filename
-        torch.save(checkpoint, detailed_path)
-    
-    def load_checkpoint(self, checkpoint_path: str) -> int:
-        checkpoint = torch.load(checkpoint_path, map_location=self.device)
         self.model.load_state_dict(checkpoint['model_state_dict'])
         self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-        # Handle both 'best_val_loss' and 'best_test_loss' for backwards compatibility
-        if 'best_test_loss' in checkpoint:
-            self.best_test_loss = checkpoint['best_test_loss']
-        elif 'best_val_loss' in checkpoint:
-            self.best_test_loss = checkpoint['best_val_loss']
-        else:
-            self.best_test_loss = float('inf')
-        # Handle history keys for backwards compatibility
-        if 'history' in checkpoint:
-            history = checkpoint['history']
-            # Convert 'val_loss' to 'test_loss' if needed
-            if 'val_loss' in history and 'test_loss' not in history:
-                history['test_loss'] = history.pop('val_loss')
-            self.history = history
-        else:
-            self.history = {
-                'train_loss': [],
-                'test_loss': [],
-                'learning_rates': []
-            }
-        return checkpoint['epoch']
-    
-    def find_latest_checkpoint(self) -> Optional[str]:
-        """Find the latest checkpoint (final_model.pt)."""
-        if self.checkpoint_dir is None or not self.checkpoint_dir.exists():
-            return None
         
-        final_model_path = self.checkpoint_dir / 'final_model.pt'
-        if final_model_path.exists():
-            return str(final_model_path)
+        self.start_epoch = checkpoint['epoch'] + 1
+        self.history = checkpoint.get('metrics', {}).get('history', self.history)
+        self.best_val_loss = checkpoint.get('metrics', {}).get('best_val_loss', float('inf'))
         
-        return None
+        logger.info(f"Resumed from epoch {self.start_epoch}, best_val_loss: {self.best_val_loss:.6f}")
     
-    def load_latest_checkpoint(self) -> int:
-        """Load the latest checkpoint (final_model.pt) if it exists.
+    def train(self) -> Dict[str, List[float]]:
+        """
+        Train the model with professional checkpoint and logging management.
         
         Returns:
-            The next epoch to start training from (0 if no checkpoint found)
+            Dictionary containing training history
         """
-        latest_path = self.find_latest_checkpoint()
-        if latest_path is None:
-            print("No checkpoint found, starting from scratch")
-            return 0
+        self._load_checkpoint_state()
         
-        print(f"Loading checkpoint: {latest_path}")
-        epoch = self.load_checkpoint(latest_path)
-        print(f"Loaded checkpoint from epoch {epoch + 1}")
-        next_epoch = epoch + 1
-        
-        if next_epoch >= self.num_epochs:
-            print(f"Warning: Checkpoint is from epoch {epoch + 1}, but num_epochs={self.num_epochs}. "
-                  f"Training will start from epoch {next_epoch}. Increase num_epochs to continue training.")
-        
-        return next_epoch
-    
-    def train(self, resume: bool = True) -> Dict[str, List[float]]:
-        """Train the model. Automatically loads final_model.pt if it exists.
-        
-        Args:
-            resume: If True, automatically load final_model.pt if it exists (default: True)
-        """
-
-        if self.test_loader is not None:
-            logger.info(f"Test batches: {len(self.test_loader)}")
-        logger.info("-" * 60)
-        start_epoch = 0
-        if resume:
-            start_epoch = self.load_latest_checkpoint()
-        
-        logger.info(f"Training on {self.device}")
-        logger.info(f"Total epochs: {self.num_epochs}")
-        logger.info(f"Starting from epoch: {start_epoch + 1}")
-        logger.info(f"Batch size: {self.train_loader.batch_size}")
+        logger.info("=" * 70)
+        logger.info(f"Training: {self.dataset_name} (run_id: {self.run_id})")
+        logger.info(f"Device: {self.device}")
+        logger.info(f"Epochs: {self.start_epoch + 1} -> {self.num_epochs}")
+        logger.info(f"Batch size: {self.batch_size}")
+        logger.info(f"Learning rate: {self.learning_rate}")
         logger.info(f"Train batches: {len(self.train_loader)}")
-        if self.test_loader is not None:
-            logger.info(f"Test batches: {len(self.test_loader)}")
-        logger.info("-" * 60)
+        if self.test_loader:
+            logger.info(f"Val batches: {len(self.test_loader)}")
+        logger.info(f"Model parameters: {self.count_parameters(self.model):,}")
+        logger.info(f"Loss: {self.loss_name}")
+        logger.info("=" * 70)
         
-        for epoch in range(start_epoch, self.num_epochs):
-            start_time = time.time()
+        training_start_time = time.time()
+        
+        for epoch in range(self.start_epoch, self.num_epochs):
+            epoch_start_time = time.time()
             
             train_loss = self.train_epoch(epoch)
-            test_loss = self.validate()
+            val_loss = self.validate()
             
             self.scheduler.step()
             current_lr = self.optimizer.param_groups[0]['lr']
             
             self.history['train_loss'].append(train_loss)
-            self.history['test_loss'].append(test_loss)
+            self.history['val_loss'].append(val_loss)
             self.history['learning_rates'].append(current_lr)
             
-            epoch_time = time.time() - start_time
-            
-            logger.info(f"Epoch {epoch+1}/{self.num_epochs} | "
-                  f"Train Loss: {train_loss:.6f} | "
-                  f"Test Loss: {test_loss:.6f} | "
-                  f"LR: {current_lr:.2e} | "
-                  f"Time: {epoch_time:.2f}s")
-            
-            if test_loss < self.best_test_loss:
-                self.best_test_loss = test_loss
+            epoch_time = time.time() - epoch_start_time
+
+            if self.test_loader is not None:
+                metric = val_loss
+            else:
+                metric = train_loss
+
+            is_best = metric < self.best_val_loss
+            if is_best:
+                self.best_val_loss = metric
                 self.epochs_without_improvement = 0
             else:
                 self.epochs_without_improvement += 1
             
-            if self.early_stopping_patience != -1 and self.epochs_without_improvement >= self.early_stopping_patience:
-                logger.info(f"\nEarly stopping triggered after {epoch+1} epochs")
-                break
-
-        print("-" * 60)
-
-
-        if self.logger is not None:
-            self.logger.log(
-                run_type='training',
-                dataset_name=f"{self.dataset_name}_epoch_{self.num_epochs}_batches_{len(self.train_loader)}",
-                dataset_shape=self.get_dataset_shape(),
-                dataset_size=self.train_dataset.df.memory_usage().sum(),
-                model_parameters=self.count_parameters(self.model),
-                context_window=self.train_dataset.context_window,
-                prediction_length=self.train_dataset.prediction_length,
-                epoch=self.num_epochs,
-                total_epochs=self.num_epochs,
-                loss_type=self.loss_name,
-                training_loss=self.history['train_loss'][-1],
-                validation_loss=self.history['test_loss'][-1],
-                training_history=self.history['train_loss'],
-                validation_history=self.history['test_loss']
+            logger.info(
+                f"Epoch {epoch + 1}/{self.num_epochs} | "
+                f"Train: {train_loss:.6f} | "
+                f"Val: {val_loss:.6f} | "
+                f"LR: {current_lr:.2e} | "
+                f"Time: {epoch_time:.2f}s"
+                f"{' [BEST]' if is_best else ''}"
             )
-            print(f"Training run logged to {self.logger.csv_path}")
-
-        logger.info(f"Training completed. Best Test Loss: {self.best_test_loss:.6f}")
-        if self.checkpoint_dir is not None:
-            logger.info(f"Final model saved to {self.checkpoint_dir / 'final_model.pt'}")
+            
+            if self.checkpoint_manager:
+                metrics = {
+                    'train_loss': train_loss,
+                    'val_loss': val_loss,
+                    'learning_rate': current_lr,
+                    'best_val_loss': self.best_val_loss,
+                    'history': self.history
+                }
+                metadata = {
+                    'batch_size': self.batch_size,
+                    'learning_rate': self.learning_rate,
+                    'loss_name': self.loss_name
+                }
+                self.checkpoint_manager.save_checkpoint(
+                    epoch=epoch,
+                    model_state=self.model.state_dict(),
+                    optimizer_state=self.optimizer.state_dict(),
+                    scheduler_state=self.scheduler.state_dict(),
+                    metrics=metrics,
+                    metadata=metadata,
+                    is_best=is_best
+                )
+            
+            if self.training_logger:
+                self.training_logger.log_epoch(
+                    epoch=epoch,
+                    train_loss=train_loss,
+                    val_loss=val_loss,
+                    learning_rate=current_lr,
+                    epoch_time=epoch_time,
+                    best_val_loss=self.best_val_loss
+                )
+            
+            if self.early_stopping_patience > 0 and self.epochs_without_improvement >= self.early_stopping_patience:
+                logger.info(f"Early stopping triggered after {epoch + 1} epochs")
+                break
+        
+        total_training_time = time.time() - training_start_time
+        
+        logger.info("=" * 70)
+        logger.info("Training completed!")
+        logger.info(f"Best validation loss: {self.best_val_loss:.6f}")
+        logger.info(f"Total training time: {total_training_time:.2f}s")
+        logger.info("=" * 70)
+        
+        if self.training_logger:
+            summary = {
+                'total_epochs': len(self.history['train_loss']),
+                'best_val_loss': self.best_val_loss,
+                'final_train_loss': self.history['train_loss'][-1] if self.history['train_loss'] else 0,
+                'final_val_loss': self.history['val_loss'][-1] if self.history['val_loss'] else 0,
+                'total_time_sec': total_training_time,
+                'model_parameters': self.count_parameters(self.model),
+                'batch_size': self.batch_size,
+                'learning_rate': self.learning_rate,
+                'loss_name': self.loss_name
+            }
+            self.training_logger.log_summary(summary)
         
         return self.history
     
@@ -602,13 +888,13 @@ class TanaForecastTester:
         test_dataset: TimeSeriesDataset,
         batch_size: int = 32,
         device: str = "cuda" if torch.cuda.is_available() else "cpu",
-        logger: Optional[Logger] = None,
+        training_logger: Optional[TrainingLogger] = None,
         dataset_name: str = "test"
     ) -> None:
         self.model = model.to(device)
         self.device = device
         self.test_dataset = test_dataset
-        self.logger = logger
+        self.logger = training_logger
         self.dataset_name = dataset_name
         
         self.test_loader = DataLoader(
@@ -669,7 +955,6 @@ class TanaForecastTester:
                 
                 predictions = self.model(context)
                 
-                # Compute losses
                 mse_loss = criterion(predictions, target)
                 mae_loss = torch.mean(torch.abs(predictions - target))
                 
@@ -677,7 +962,6 @@ class TanaForecastTester:
                 total_mae += mae_loss.item()
                 num_batches += 1
                 
-                # Store for additional metrics
                 all_predictions.append(predictions.cpu())
                 all_targets.append(target.cpu())
         
@@ -687,11 +971,9 @@ class TanaForecastTester:
         avg_mape = np.mean(np.abs((all_targets - all_predictions) / all_targets))
         avg_smape = np.mean(np.abs((all_targets - all_predictions) / (all_targets + all_predictions) / 2))
 
-        # Concatenate all predictions and targets
         all_predictions = torch.cat(all_predictions, dim=0)
         all_targets = torch.cat(all_targets, dim=0)
         
-        # Compute R² score
         ss_res = torch.sum((all_targets - all_predictions) ** 2)
         ss_tot = torch.sum((all_targets - all_targets.mean()) ** 2)
         r2_score = 1 - (ss_res / ss_tot).item()
@@ -714,7 +996,6 @@ class TanaForecastTester:
         print(f"Test SMAPE: {avg_smape:.6f}")
         print("-" * 60)
         
-        # Log to CSV if logger is provided
         if self.logger is not None:
             num_params = self.count_parameters(self.model)
             dataset_shape = self.get_dataset_shape()
@@ -724,7 +1005,7 @@ class TanaForecastTester:
                 dataset_name=f"{self.dataset_name}_test",
                 dataset_shape=dataset_shape,
                 model_parameters=num_params,
-                epoch=0,  # 0 for test runs
+                epoch=0,
                 total_epochs=0,
                 loss_type=loss_type,
                 training_loss=avg_mse,
@@ -774,82 +1055,3 @@ class TanaForecastTester:
         targets = torch.cat(all_targets, dim=0)
         
         return predictions, targets
-
-
-if __name__ == "__main__":
-    from src.model import TanaForecast
-    
-    # Create sample data
-    df = pd.DataFrame({
-        'feature1': np.random.randn(1000),
-        'feature2': np.random.randn(1000),
-    })
-    
-    # Create datasets
-    train_dataset = TimeSeriesDataset(
-        df=df[:700],
-        context_window=100,
-        prediction_length=12,
-        stride=1,
-        normalize=True
-    )
-    
-    val_dataset = TimeSeriesDataset(
-        df=df[600:850],
-        context_window=100,
-        prediction_length=12,
-        stride=1,
-        normalize=True
-    )
-    
-    test_dataset = TimeSeriesDataset(
-        df=df[800:],
-        context_window=100,
-        prediction_length=12,
-        stride=1,
-        normalize=True
-    )
-    
-    # Initialize logger
-    logger = Logger(csv_path='src/logs/training_logs.csv')
-    
-    # Create model
-    model = TanaForecast(context_window=100, prediction_length=12)
-    
-    # Train
-    trainer = TanaForecastTrainer(
-        model=model,
-        train_dataset=train_dataset,
-        val_dataset=val_dataset,
-        batch_size=32,
-        learning_rate=1e-3,
-        num_epochs=5,
-        checkpoint_dir='checkpoints/example',
-        logger=logger,
-        dataset_name='example_dataset'
-    )
-    
-    history = trainer.train()
-    
-    # Test
-    tester = TanaForecastTester(
-        model=model,
-        test_dataset=test_dataset,
-        batch_size=32,
-        logger=logger,
-        dataset_name='example_dataset'
-    )
-    
-    metrics = tester.evaluate()
-    
-    # Make a single prediction
-    context, target = test_dataset[0]
-    prediction = tester.predict(context.unsqueeze(0))
-    print(f"\nSingle prediction shape: {prediction.shape}")
-    print(f"Target shape: {target.shape}")
-    
-    # View logged runs
-    print("\n" + "="*60)
-    print("Logged Training Runs:")
-    print("="*60)
-    print(logger.read_logs())

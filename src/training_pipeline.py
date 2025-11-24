@@ -2,8 +2,6 @@ import pandas as pd
 from pathlib import Path
 import sys
 
-# Get project root from the script's location
-# This file is in src/, so project root is the parent directory
 project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
@@ -22,7 +20,8 @@ class RunDatasetTraining:
         prediction_length: int,
         feature_columns: List[str],
         target_columns: List[str],
-        timestamp_column: str
+        timestamp_column: str,
+        device: str = "cpu"
     ) -> None:
         self.dataset_name = dataset_name
         self.original_context_window = context_window
@@ -30,8 +29,8 @@ class RunDatasetTraining:
         self.feature_columns = feature_columns
         self.target_columns = target_columns
         self.timestamp_column = timestamp_column
+        self.device = device
         
-        # Determine train/test DataFrames
         if test_dataset is not None:
             train_df = train_dataset
             test_df = test_dataset
@@ -46,7 +45,6 @@ class RunDatasetTraining:
             split_name="train"
         )
 
-        # Create TimeSeriesDataset instances
         self.train_dataset = TimeSeriesDataset(
             df=train_df,
             context_window=self.context_window,
@@ -65,22 +63,27 @@ class RunDatasetTraining:
 
         self.model = TanaForecast(
             context_window=self.context_window,
-            prediction_length=self.prediction_length
+            prediction_length=self.prediction_length,
+            device=self.device
         )
 
         self.trainer = TanaForecastTrainer(
             model=self.model,
             train_dataset=self.train_dataset,
             test_dataset=self.test_dataset,
-            batch_size=64,
+            batch_size=8,
             learning_rate=1e-3,
             dataset_name=self.dataset_name,
             num_epochs=10,
             checkpoint_dir=str(project_root / 'checkpoints'),
-            early_stopping_patience=-1,
+            log_dir=str(project_root / 'src' / 'logs'),
+            early_stopping_patience=2,
             loss_fn=Loss.quantile_loss,
             loss_name='Quantile_0.9',
-            loss_kwargs={'q': 0.9}
+            loss_kwargs={'q': 0.9},
+            keep_checkpoints=3,
+            resume_from_checkpoint=True,
+            device=self.device,
         )
 
     def run(self) -> None:
@@ -141,23 +144,23 @@ class RunDatasetTraining:
         )
 
 if __name__ == "__main__":
-    train_dataset = pd.read_csv(project_root / 'src' / 'datasets' / 'stock_china' / '000001.XSHE.csv')
-    print(train_dataset.shape)
-    LAST_INDEX = 1000
-    train_dataset = train_dataset.iloc[:LAST_INDEX]
-    feature_columns = ['open','high','low','volume', 'money', 'avg', 'high_limit', 'low_limit', 'pre_close', 'paused', 'factor']
-    target_columns = ['close']
-    timestamp_column = 'timestamp'
+    dataset = pd.read_csv(project_root / 'src' / 'datasets' / 'bitcoin' / 'train.csv')
+    print(f"Bitcoin: {dataset.shape}")
+    
+    ms_feature_columns = ['open','high','low','volume', 'close_time', 'quote_asset_volume', 'number_of_trades', 'taker_buy_base_asset_volume', 'taker_buy_quote_asset_volume']
+    ms_target_columns = ['close']
+    ms_timestamp_column = 'timestamp'
 
-    run_dataset_training = RunDatasetTraining(
-        train_dataset=train_dataset.copy(),
-        dataset_name='stock_china',
+    training = RunDatasetTraining(
+        train_dataset=dataset.copy(),
+        dataset_name='bitcoin',
         test_dataset=None,
-        context_window=Constants.context_window,
-        prediction_length=Constants.prediction_length,
-        feature_columns=feature_columns,
-        target_columns=target_columns,
-        timestamp_column=timestamp_column
+        context_window=1024,
+        prediction_length=256,
+        feature_columns=ms_feature_columns,
+        target_columns=ms_target_columns,
+        timestamp_column=ms_timestamp_column,
+        device="mps"
     )
     
-    run_dataset_training.run()
+    training.run()

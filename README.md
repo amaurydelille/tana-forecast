@@ -5,7 +5,7 @@ A decoder only time-series foundation model designed to outperform current time-
 
 ![Tana Forecast Architecture](assets/tana-forecast.drawio.png)
 
-The model, which has 208 millions parameters, is being trained on diverse datasets spanning financial markets (S&P 500, stock prices, etc.), logistics (material demand, trade statistics, etc.), and natural events (weather patterns, natural disasters, etc.).
+The model, which has 280 millions parameters, is being trained on diverse datasets spanning financial markets (S&P 500, stock prices, etc.), logistics (material demand, trade statistics, etc.), and natural events (weather patterns, natural disasters, etc.).
 We chose a default 4096 data points context window and 256 data points prediction length.
 
 The model is tested on ```fev-benchmark```.

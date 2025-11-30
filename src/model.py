@@ -1,11 +1,8 @@
-import datetime
-import pandas as pd
-import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
-from typing import List, Iterable, Union
+from typing import List
 
 from src.utils import Constants
 
@@ -126,16 +123,18 @@ class DeepCrossNetwork(nn.Module):
         return output
 
 class MultiHeadCausalSelfAttention(nn.Module):
-    def __init__(self, d_model: int, num_heads: int = 8) -> None:
+    def __init__(self, d_model: int, num_heads: int = Constants.attention_heads) -> None:
         super().__init__()
         self.d_model = d_model
         assert d_model % num_heads == 0, "d_model must be divisible by num_heads"
-        self.q = nn.Linear(in_features=d_model, out_features=d_model)
-        self.k = nn.Linear(in_features=d_model, out_features=d_model)
-        self.v = nn.Linear(in_features=d_model, out_features=d_model)
+
+        self.d_k = d_model // num_heads
+
+        self.q = nn.Linear(in_features=d_model, out_features=d_model, bias=False)
+        self.k = nn.Linear(in_features=d_model, out_features=d_model, bias=False)
+        self.v = nn.Linear(in_features=d_model, out_features=d_model, bias=False)
         self.out = nn.Linear(in_features=d_model, out_features=d_model)
         self.num_heads = num_heads
-        self.d_model_per_head = d_model // num_heads
 
     def forward(self, X: torch.Tensor) -> torch.Tensor:
         """
@@ -144,11 +143,11 @@ class MultiHeadCausalSelfAttention(nn.Module):
         """
         B, N, D = X.shape
 
-        q = self.q(X).view(B, N, self.num_heads, self.d_model_per_head).transpose(1, 2)
-        k = self.k(X).view(B, N, self.num_heads, self.d_model_per_head).transpose(1, 2)
-        v = self.v(X).view(B, N, self.num_heads, self.d_model_per_head).transpose(1, 2)
+        q = self.q(X).view(B, N, self.num_heads, self.d_k).transpose(1, 2)
+        k = self.k(X).view(B, N, self.num_heads, self.d_k).transpose(1, 2)
+        v = self.v(X).view(B, N, self.num_heads, self.d_k).transpose(1, 2)
 
-        attention_scores = (q @ k.transpose(-2, -1)) / math.sqrt(self.d_model_per_head)
+        attention_scores = (q @ k.transpose(-2, -1)) / math.sqrt(self.d_k)
 
         mask = torch.triu(torch.ones(N, N, device=X.device, dtype=torch.bool), diagonal=1)
         attention_scores = attention_scores.masked_fill(mask, float('-inf'))
@@ -244,7 +243,7 @@ class Decoder(nn.Module):
         )
         self.deep_cross = DeepCrossNetwork(d_model=Constants.d_out, n_cross_layers=3, n_deep_layers=3, deep_hidden_dim=Constants.d_out * 2, dropout=0.1)
         self.layer_norm_1 = nn.LayerNorm(Constants.d_out)
-        self.attention = MultiHeadCausalSelfAttention(d_model=Constants.d_out)
+        self.attention = MultiHeadCausalSelfAttention(d_model=Constants.d_out, num_heads=Constants.attention_heads)
         self.layer_norm_2 = nn.LayerNorm(Constants.d_out)
         self.moe = MixtureOfExpert(d_model=Constants.d_out, n_experts=Constants.n_experts, top_k=Constants.top_k, monitor=self.monitor, return_router_info=return_router_info)
         self.out = nn.Linear(in_features=Constants.d_out, out_features=prediction_length)
@@ -294,7 +293,6 @@ class TanaForecast(nn.Module):
 
         self.device = device if device is not None else "mps" if torch.backends.mps.is_available() else "cpu"
 
-        # to monitor router activation
         self.monitor = Monitor()
 
         self.context_window = context_window
@@ -311,6 +309,40 @@ class TanaForecast(nn.Module):
         ])
 
         self.number_of_parameters = sum(p.numel() for p in self.parameters())
+    
+    @classmethod
+    def from_pretrained(
+        cls,
+        context_window: int,
+        prediction_length: int,
+        checkpoint_path: str = None,
+        device: str = None
+    ):
+        """
+        Create a TanaForecast model and load pretrained weights.
+        
+        Args:
+            context_window: Context window size
+            prediction_length: Prediction length
+            checkpoint_path: Path to checkpoint. If None, uses default foundation_latest.pt
+            device: Device to load model on
+            
+        Returns:
+            TanaForecast model with pretrained weights
+            
+        Example:
+            model = TanaForecast.from_pretrained(1024, 256, device="mps")
+        """
+        if device is None:
+            device = "mps" if torch.backends.mps.is_available() else "cpu"
+        
+        model = cls(
+            context_window=context_window,
+            prediction_length=prediction_length,
+            device=device
+        )
+        model.load_foundation_weights(checkpoint_path)
+        return model
 
     def forward(self, X: torch.Tensor, prediction_length: int = 12):
         outputs = []
@@ -350,9 +382,44 @@ class TanaForecast(nn.Module):
     def forecast(self, X: torch.Tensor, context_window: int, prediction_length: int) -> torch.Tensor:
         X = X[:, -context_window:, :]
         return self.forward(X, prediction_length)
+    
+    def load_foundation_weights(self, checkpoint_path: str = None) -> bool:
+        """
+        Load foundation model weights from checkpoint.
+        
+        Args:
+            checkpoint_path: Path to checkpoint file. If None, uses default foundation_latest.pt
+            
+        Returns:
+            True if weights loaded successfully, False otherwise
+        """
+        if checkpoint_path is None:
+            from pathlib import Path
+            project_root = Path(__file__).parent.parent
+            checkpoint_path = project_root / 'checkpoints' / 'foundation_latest.pt'
+        else:
+            from pathlib import Path
+            checkpoint_path = Path(checkpoint_path)
+        
+        if not checkpoint_path.exists():
+            print(f"No checkpoint found at {checkpoint_path}")
+            return False
+        
+        try:
+            checkpoint = torch.load(checkpoint_path, map_location=self.device)
+            if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
+                self.load_state_dict(checkpoint['model_state_dict'])
+            else:
+                self.load_state_dict(checkpoint)
+            print(f"Foundation weights loaded from {checkpoint_path}")
+            return True
+        except Exception as e:
+            print(f"Failed to load weights: {e}")
+            return False
 
 if __name__ == "__main__":
     X = torch.randn(1, 2, 100)
-    decoder = TanaForecast(context_window=100, prediction_length=12)
+    decoder = TanaForecast(context_window=100, prediction_length=12, device="mps")
     y = decoder(X)
     print(y)
+    print(decoder.number_of_parameters)

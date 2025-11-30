@@ -49,8 +49,7 @@ class CheckpointManager:
         self.run_id = run_id or datetime.now().strftime("%Y%m%d_%H%M%S")
         self.keep_last_n = keep_last_n
         
-        # Create directory structure: checkpoints/{dataset_name}/{run_id}/
-        self.run_dir = self.base_dir / self.dataset_name / self.run_id
+        self.run_dir = self.base_dir
         self.run_dir.mkdir(parents=True, exist_ok=True)
         
         self.metadata_path = self.run_dir / "metadata.json"
@@ -197,18 +196,17 @@ class CheckpointManager:
         dataset_name: str
     ) -> Optional[str]:
         """Get the latest run_id for a dataset (for resuming)."""
-        dataset_dir = base_dir / CheckpointManager._sanitize_name(dataset_name)
-        
-        if not dataset_dir.exists():
+        if not base_dir.exists():
             return None
         
-        run_dirs = [d for d in dataset_dir.iterdir() if d.is_dir()]
+        metadata_file = base_dir / "metadata.json"
+        if metadata_file.exists():
+            import json
+            with open(metadata_file, 'r') as f:
+                metadata = json.load(f)
+                return metadata.get('run_id')
         
-        if not run_dirs:
-            return None
-        
-        latest_run = max(run_dirs, key=lambda p: p.stat().st_mtime)
-        return latest_run.name
+        return None
 
 
 class TrainingLogger:
@@ -574,12 +572,16 @@ class TanaForecastTrainer:
             self.criterion = loss_fn
         self.use_custom_loss = loss_fn is not None
         
+        pin_memory = self.device == "cuda" or (isinstance(self.device, torch.device) and self.device.type == "cuda")
+        num_workers = 2 if pin_memory else 0
+        
         self.train_loader = DataLoader(
             train_dataset,
             batch_size=batch_size,
             shuffle=True,
-            num_workers=0,
-            pin_memory=True if device == "mps" else False
+            num_workers=num_workers,
+            pin_memory=pin_memory,
+            persistent_workers=num_workers > 0
         )
         
         if test_dataset is not None:
@@ -587,8 +589,9 @@ class TanaForecastTrainer:
                 test_dataset,
                 batch_size=batch_size,
                 shuffle=False,
-                num_workers=0,
-                pin_memory=True
+                num_workers=num_workers,
+                pin_memory=pin_memory,
+                persistent_workers=num_workers > 0
             )
         else:
             self.test_loader = None
@@ -637,6 +640,32 @@ class TanaForecastTrainer:
         self.best_val_loss = float('inf')
         self.epochs_without_improvement = 0
         self.start_epoch = 0
+        
+        self._setup_mixed_precision()
+    
+    def _setup_mixed_precision(self) -> None:
+        """Setup mixed precision training based on device."""
+        if self.device == "cuda" or (isinstance(self.device, torch.device) and self.device.type == "cuda"):
+            self.use_amp = True
+            self.amp_dtype = torch.float16
+            self.scaler = torch.cuda.amp.GradScaler()
+            logger.info("Mixed precision enabled for CUDA (FP16 + GradScaler)")
+        elif self.device == "mps" or (isinstance(self.device, torch.device) and self.device.type == "mps"):
+            self.use_amp = False
+            self.amp_dtype = None
+            self.scaler = None
+            logger.info("Full precision for MPS (FP32) - MPS autocast not yet stable")
+        else:
+            self.use_amp = False
+            self.amp_dtype = None
+            self.scaler = None
+            logger.info("Full precision for CPU (FP32)")
+    
+    def _get_device_type(self) -> str:
+        """Get normalized device type string."""
+        if isinstance(self.device, torch.device):
+            return self.device.type
+        return str(self.device)
     
     @staticmethod
     def count_parameters(model: nn.Module) -> int:
@@ -658,6 +687,12 @@ class TanaForecastTrainer:
         self.model.train()
         total_loss = 0.0
         num_batches = 0
+        
+        device_type = self._get_device_type()
+        if device_type == "mps":
+            torch.mps.empty_cache()
+        elif device_type == "cuda":
+            torch.cuda.empty_cache()
 
         for context, target in self.train_loader:
             context = context.to(self.device)
@@ -668,47 +703,30 @@ class TanaForecastTrainer:
             
             self.optimizer.zero_grad()
             
-            if hasattr(self.model, 'return_router_info') and self.model.return_router_info:
-                predictions, router_probs, expert_indices = self.model(context)
-                loss = self.criterion(
-                    y_true=target,
-                    y_pred=predictions,
-                    router_probs=router_probs,
-                    expert_indices=expert_indices,
-                    **self.loss_kwargs
-                )
+            if self.use_amp:
+                with torch.amp.autocast(device_type=device_type, dtype=self.amp_dtype):
+                    if hasattr(self.model, 'return_router_info') and self.model.return_router_info:
+                        predictions, router_probs, expert_indices = self.model(context)
+                        loss = self.criterion(
+                            y_true=target,
+                            y_pred=predictions,
+                            router_probs=router_probs,
+                            expert_indices=expert_indices,
+                            **self.loss_kwargs
+                        )
+                    else:
+                        predictions = self.model(context)
+                        if self.use_custom_loss:
+                            loss = self.criterion(target, predictions, **self.loss_kwargs)
+                        else:
+                            loss = self.criterion(predictions, target)
+                
+                self.scaler.scale(loss).backward()
+                self.scaler.unscale_(self.optimizer)
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
             else:
-                predictions = self.model(context)
-                if self.use_custom_loss:
-                    loss = self.criterion(target, predictions, **self.loss_kwargs)
-                else:
-                    loss = self.criterion(predictions, target)
-            
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-            self.optimizer.step()
-            
-            total_loss += loss.item()
-            num_batches += 1
-        
-        return total_loss / num_batches if num_batches > 0 else 0.0
-    
-    def validate(self) -> float:
-        if self.test_loader is None:
-            return 0.0
-        
-        self.model.eval()
-        total_loss = 0.0
-        num_batches = 0
-        
-        with torch.no_grad():
-            for context, target in self.test_loader:
-                context = context.to(self.device)
-                target = target.to(self.device)
-                
-                if target.dim() == 3 and target.size(1) == 1:
-                    target = target.squeeze(1)
-                
                 if hasattr(self.model, 'return_router_info') and self.model.return_router_info:
                     predictions, router_probs, expert_indices = self.model(context)
                     loss = self.criterion(
@@ -724,6 +742,67 @@ class TanaForecastTrainer:
                         loss = self.criterion(target, predictions, **self.loss_kwargs)
                     else:
                         loss = self.criterion(predictions, target)
+                
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                self.optimizer.step()
+            
+            total_loss += loss.item()
+            num_batches += 1
+        
+        return total_loss / num_batches if num_batches > 0 else 0.0
+    
+    def validate(self) -> float:
+        if self.test_loader is None:
+            return 0.0
+        
+        self.model.eval()
+        total_loss = 0.0
+        num_batches = 0
+        
+        device_type = self._get_device_type()
+        
+        with torch.no_grad():
+            for context, target in self.test_loader:
+                context = context.to(self.device)
+                target = target.to(self.device)
+                
+                if target.dim() == 3 and target.size(1) == 1:
+                    target = target.squeeze(1)
+                
+                if self.use_amp:
+                    with torch.amp.autocast(device_type=device_type, dtype=self.amp_dtype):
+                        if hasattr(self.model, 'return_router_info') and self.model.return_router_info:
+                            predictions, router_probs, expert_indices = self.model(context)
+                            loss = self.criterion(
+                                y_true=target,
+                                y_pred=predictions,
+                                router_probs=router_probs,
+                                expert_indices=expert_indices,
+                                **self.loss_kwargs
+                            )
+                        else:
+                            predictions = self.model(context)
+                            if self.use_custom_loss:
+                                loss = self.criterion(target, predictions, **self.loss_kwargs)
+                            else:
+                                loss = self.criterion(predictions, target)
+                else:
+                    if hasattr(self.model, 'return_router_info') and self.model.return_router_info:
+                        predictions, router_probs, expert_indices = self.model(context)
+                        loss = self.criterion(
+                            y_true=target,
+                            y_pred=predictions,
+                            router_probs=router_probs,
+                            expert_indices=expert_indices,
+                            **self.loss_kwargs
+                        )
+                    else:
+                        predictions = self.model(context)
+                        if self.use_custom_loss:
+                            loss = self.criterion(target, predictions, **self.loss_kwargs)
+                        else:
+                            loss = self.criterion(predictions, target)
                 
                 total_loss += loss.item()
                 num_batches += 1
@@ -787,7 +866,7 @@ class TanaForecastTrainer:
             self.history['learning_rates'].append(current_lr)
             
             epoch_time = time.time() - epoch_start_time
-
+            
             if self.test_loader is not None:
                 metric = val_loss
             else:

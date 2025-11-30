@@ -1,6 +1,8 @@
 import pandas as pd
 from pathlib import Path
 import sys
+import torch
+import logging
 
 project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
@@ -9,6 +11,9 @@ from src.model import TanaForecast
 from src.trainer import TanaForecastTrainer, TimeSeriesDataset
 from src.utils import Loss, Constants
 from typing import List, Optional
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 class RunDatasetTraining:
     def __init__(
@@ -66,12 +71,22 @@ class RunDatasetTraining:
             prediction_length=self.prediction_length,
             device=self.device
         )
+        
+        self._load_foundation_weights()
 
+        batch_size_map = {
+            'cuda': 16,
+            'mps': 4,
+            'cpu': 8
+        }
+        device_str = self.device if isinstance(self.device, str) else self.device.type
+        batch_size = batch_size_map.get(device_str, 8)
+        
         self.trainer = TanaForecastTrainer(
             model=self.model,
             train_dataset=self.train_dataset,
             test_dataset=self.test_dataset,
-            batch_size=8,
+            batch_size=batch_size,
             learning_rate=1e-3,
             dataset_name=self.dataset_name,
             num_epochs=10,
@@ -88,6 +103,30 @@ class RunDatasetTraining:
 
     def run(self) -> None:
         self.trainer.train()
+        self._save_foundation_weights()
+    
+    def _load_foundation_weights(self) -> None:
+        foundation_checkpoint = project_root / 'checkpoints' / 'foundation_latest.pt'
+        if foundation_checkpoint.exists():
+            logger.info(f"Loading foundation weights from {foundation_checkpoint}")
+            try:
+                checkpoint = torch.load(foundation_checkpoint, map_location=self.device)
+                if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
+                    self.model.load_state_dict(checkpoint['model_state_dict'])
+                else:
+                    self.model.load_state_dict(checkpoint)
+                logger.info("Foundation weights loaded successfully")
+            except Exception as e:
+                logger.warning(f"Failed to load foundation weights: {e}. Starting from scratch.")
+        else:
+            logger.info("No foundation checkpoint found. Starting from scratch.")
+    
+    def _save_foundation_weights(self) -> None:
+        foundation_checkpoint = project_root / 'checkpoints' / 'foundation_latest.pt'
+        foundation_checkpoint.parent.mkdir(parents=True, exist_ok=True)
+        logger.info(f"Saving foundation weights to {foundation_checkpoint}")
+        torch.save(self.model.state_dict(), foundation_checkpoint)
+        logger.info("Foundation weights saved successfully")
 
     def _get_effective_context_window(
         self,
@@ -144,23 +183,35 @@ class RunDatasetTraining:
         )
 
 if __name__ == "__main__":
-    dataset = pd.read_csv(project_root / 'src' / 'datasets' / 'bitcoin' / 'train.csv')
-    print(f"Bitcoin: {dataset.shape}")
-    
-    ms_feature_columns = ['open','high','low','volume', 'close_time', 'quote_asset_volume', 'number_of_trades', 'taker_buy_base_asset_volume', 'taker_buy_quote_asset_volume']
-    ms_target_columns = ['close']
-    ms_timestamp_column = 'timestamp'
+    import yfinance as yf
 
-    training = RunDatasetTraining(
-        train_dataset=dataset.copy(),
-        dataset_name='bitcoin',
-        test_dataset=None,
-        context_window=1024,
-        prediction_length=256,
-        feature_columns=ms_feature_columns,
-        target_columns=ms_target_columns,
-        timestamp_column=ms_timestamp_column,
-        device="mps"
-    )
-    
-    training.run()
+    # dataset = pd.read_csv(project_root / 'src' / 'datasets' / 'alibaba' / 'train.csv')
+    tickers = ["JPY=X"]
+
+    for ticker in tickers:
+        try:
+            dataset = yf.download(ticker, period="max")
+            dataset = dataset.reset_index()
+            print(f"{ticker}: {dataset.shape}")
+            print(f"Date range: {dataset['Date'].min()} to {dataset['Date'].max()}")
+            
+            ms_feature_columns = ['Open','High','Low','Volume']
+            ms_target_columns = ['Close']
+            ms_timestamp_column = 'Date'
+
+            training = RunDatasetTraining(
+                train_dataset=dataset.copy(),
+                dataset_name=ticker,
+                test_dataset=None,
+                context_window=4096,
+                prediction_length=256,
+                feature_columns=ms_feature_columns,
+                target_columns=ms_target_columns,
+                timestamp_column=ms_timestamp_column,
+                device="mps"
+            )
+            
+            training.run()
+        except Exception as e:
+            logger.error(f"Error training {ticker}: {e}")
+            continue

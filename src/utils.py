@@ -319,8 +319,9 @@ class Constants:
     num_epochs: int = 100
     patch_size: int = 24
     stride: int = 12
-    d_out: int = 64
+    d_out: int = 512
     n_experts: int = 8
     top_k: int = 4
-    n_decoders: int = 6
+    n_decoders: int = 12
     d_ff: int = 2048
+    attention_heads: int = 16

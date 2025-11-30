@@ -287,11 +287,19 @@ class TanaForecast(nn.Module):
         context_window: int, 
         prediction_length: int,
         return_router_info: bool = False,
-        device: str = "mps" if torch.backends.mps.is_available() else "cpu"
+        device: str = None
     ) -> None:
         super().__init__()
 
-        self.device = device if device is not None else "mps" if torch.backends.mps.is_available() else "cpu"
+        if device is None:
+            if torch.cuda.is_available():
+                device = "cuda"
+            elif torch.backends.mps.is_available():
+                device = "mps"
+            else:
+                device = "cpu"
+        
+        self.device = device
 
         self.monitor = Monitor()
 
@@ -309,6 +317,8 @@ class TanaForecast(nn.Module):
         ])
 
         self.number_of_parameters = sum(p.numel() for p in self.parameters())
+        
+        self.to(self.device)
     
     @classmethod
     def from_pretrained(
@@ -334,7 +344,12 @@ class TanaForecast(nn.Module):
             model = TanaForecast.from_pretrained(1024, 256, device="mps")
         """
         if device is None:
-            device = "mps" if torch.backends.mps.is_available() else "cpu"
+            if torch.cuda.is_available():
+                device = "cuda"
+            elif torch.backends.mps.is_available():
+                device = "mps"
+            else:
+                device = "cpu"
         
         model = cls(
             context_window=context_window,
@@ -416,10 +431,3 @@ class TanaForecast(nn.Module):
         except Exception as e:
             print(f"Failed to load weights: {e}")
             return False
-
-if __name__ == "__main__":
-    X = torch.randn(1, 2, 100)
-    decoder = TanaForecast(context_window=100, prediction_length=12, device="mps")
-    y = decoder(X)
-    print(y)
-    print(decoder.number_of_parameters)

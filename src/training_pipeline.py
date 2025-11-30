@@ -185,8 +185,41 @@ class RunDatasetTraining:
 if __name__ == "__main__":
     import yfinance as yf
 
-    # dataset = pd.read_csv(project_root / 'src' / 'datasets' / 'alibaba' / 'train.csv')
-    tickers = ["JPY=X"]
+    tickers = [
+        # Global Indexes
+        "^GSPC", "^NDX", "^DJI", "^VIX", "^FTSE", "^GDAXI", "^FCHI",
+        "^N225", "^HSI", "000001.SS", "^KS11", "^BSESN", "^AXJO",
+
+        # Global ETFs
+        "SPY", "QQQ", "DIA", "VTI", "EEM", "EFA", "IWM",
+        "GLD", "SLV", "TLT", "HYG", "LQD", "VNQ",
+
+        # Major US Stocks
+        "AAPL", "MSFT", "AMZN", "GOOG", "GOOGL", "META",
+        "TSLA", "NVDA", "BRK-A", "BRK-B", "JPM", "XOM", "JNJ",
+
+        # Major European Stocks
+        "MC.PA", "NESN.SW", "ASML.AS", "SAP.DE", "VOW3.DE",
+
+        # Vietnamese Indexes
+        "^VNINDEX", "^HNXI",
+
+        # Vietnamese ETFs
+        "E1VFVN30", "VNM",
+
+        # Vietnamese Stocks
+        "VCB.VN", "VHM.VN", "FPT.VN", "VNM.VN",
+        "TCB.VN", "BID.VN", "HPG.VN", "MWG.VN", "VJC.VN",
+
+        # Crypto
+        "BTC-USD", "ETH-USD", "BNB-USD", "SOL-USD", "XRP-USD",
+
+        # Commodities
+        "GC=F", "SI=F", "CL=F", "BZ=F", "NG=F", "ZC=F", "ZW=F",
+
+        # Macro / FX / Rates
+        "^TNX", "DX-Y.NYB", "EURUSD=X", "JPY=X", "TIP"
+    ]
 
     for ticker in tickers:
         try:

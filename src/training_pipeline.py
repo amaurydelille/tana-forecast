@@ -112,9 +112,9 @@ class RunDatasetTraining:
             try:
                 checkpoint = torch.load(foundation_checkpoint, map_location=self.device)
                 if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
-                    self.model.load_state_dict(checkpoint['model_state_dict'])
+                    self.model.load_state_dict(checkpoint['model_state_dict'], strict=False)
                 else:
-                    self.model.load_state_dict(checkpoint)
+                    self.model.load_state_dict(checkpoint, strict=False)
                 logger.info("Foundation weights loaded successfully")
             except Exception as e:
                 logger.warning(f"Failed to load foundation weights: {e}. Starting from scratch.")
@@ -233,11 +233,11 @@ if __name__ == "__main__":
             ms_timestamp_column = 'Date'
 
             training = RunDatasetTraining(
-                train_dataset=dataset.copy(),
+                train_dataset=dataset.copy()[:200],
                 dataset_name=ticker,
                 test_dataset=None,
-                context_window=4096,
-                prediction_length=256,
+                context_window=1024,
+                prediction_length=128,
                 feature_columns=ms_feature_columns,
                 target_columns=ms_target_columns,
                 timestamp_column=ms_timestamp_column,
@@ -245,6 +245,35 @@ if __name__ == "__main__":
             )
             
             training.run()
+            break
         except Exception as e:
             logger.error(f"Error training {ticker}: {e}")
             continue
+
+    import datasets
+
+    ds = datasets.load_dataset("autogluon/chronos_datasets", "m4_daily", split="train")
+    
+    for i in range(1088, len(ds)):
+        fold = ds[i]
+        timestamp_column = "timestamp"
+        target_column = "target"
+        train_df = pd.DataFrame(fold["timestamp"], columns=[timestamp_column])
+        train_df[target_column] = fold["target"]
+
+        logger.info(f"Training on {fold['id']} with {train_df.shape[0]} rows out of {len(ds)}")
+
+        training = RunDatasetTraining(
+            train_dataset=train_df,
+            dataset_name=f"m4_daily_{i}",
+            test_dataset=None,
+            context_window=train_df.shape[0] - 12,
+            prediction_length=12,
+            feature_columns=["timestamp"],
+            target_columns=["target"],
+            timestamp_column="timestamp",
+            device="mps"
+        )
+
+        training.run()  
+        break

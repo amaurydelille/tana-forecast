@@ -98,7 +98,7 @@ class Loss:
         """
         Implements the auxiliary load balancing loss from TimeMoE/Switch Transformer.
         
-        L_aux = N × Σ(f_i × r_i)
+        L_aux = N * Σ(f_i * r_i)
         where:
         - f_i is the fraction of tokens assigned to expert i
         - r_i is the average router probability for expert i
@@ -152,7 +152,7 @@ class Loss:
         """
         Implements the complete TimeMoE loss: MSE + auxiliary load balancing loss.
         
-        L_total = MSE(y_true, y_pred) + α × L_aux
+        L_total = MSE(y_true, y_pred) + alpha * L_aux
         
         Args:
             y_true: ground truth values [batch_size, ...]
@@ -322,6 +322,6 @@ class Constants:
     d_out: int = 512
     n_experts: int = 8
     top_k: int = 4
-    n_decoders: int = 12
-    d_ff: int = 2048
-    attention_heads: int = 16
+    n_decoders: int = 6
+    d_ff: int = 512
+    attention_heads: int = 8

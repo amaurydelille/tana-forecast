@@ -135,12 +135,22 @@ class CheckpointManager:
             return None
         
         logger.info(f"Loading checkpoint from {checkpoint_path}")
-        checkpoint = torch.load(checkpoint_path, map_location='cpu')
-        
-        logger.info(f"Checkpoint loaded: epoch {checkpoint['epoch'] + 1}, "
-                   f"metrics: {checkpoint.get('metrics', {})}")
-        
-        return checkpoint
+        try:
+            checkpoint = torch.load(checkpoint_path, map_location='cpu')
+            logger.info(f"Checkpoint loaded: epoch {checkpoint['epoch'] + 1}, "
+                       f"metrics: {checkpoint.get('metrics', {})}")
+            return checkpoint
+        except Exception as e:
+            logger.warning(f"Failed to load checkpoint from {checkpoint_path}: {e}")
+            logger.warning(f"Deleting corrupted checkpoint: {checkpoint_path}")
+            try:
+                checkpoint_path.unlink()
+                if self.metadata_path.exists():
+                    logger.warning(f"Deleting metadata file: {self.metadata_path}")
+                    self.metadata_path.unlink()
+            except Exception as del_e:
+                logger.error(f"Failed to delete corrupted checkpoint: {del_e}")
+            return None
     
     def list_checkpoints(self) -> List[Path]:
         """List all available checkpoints for this run."""
@@ -641,31 +651,6 @@ class TanaForecastTrainer:
         self.epochs_without_improvement = 0
         self.start_epoch = 0
         
-        self._setup_mixed_precision()
-    
-    def _setup_mixed_precision(self) -> None:
-        """Setup mixed precision training based on device."""
-        if self.device == "cuda" or (isinstance(self.device, torch.device) and self.device.type == "cuda"):
-            self.use_amp = True
-            self.amp_dtype = torch.float16
-            self.scaler = torch.cuda.amp.GradScaler()
-            logger.info("Mixed precision enabled for CUDA (FP16 + GradScaler)")
-        elif self.device == "mps" or (isinstance(self.device, torch.device) and self.device.type == "mps"):
-            self.use_amp = False
-            self.amp_dtype = None
-            self.scaler = None
-            logger.info("Full precision for MPS (FP32) - MPS autocast not yet stable")
-        else:
-            self.use_amp = False
-            self.amp_dtype = None
-            self.scaler = None
-            logger.info("Full precision for CPU (FP32)")
-    
-    def _get_device_type(self) -> str:
-        """Get normalized device type string."""
-        if isinstance(self.device, torch.device):
-            return self.device.type
-        return str(self.device)
     
     @staticmethod
     def count_parameters(model: nn.Module) -> int:
@@ -688,10 +673,9 @@ class TanaForecastTrainer:
         total_loss = 0.0
         num_batches = 0
         
-        device_type = self._get_device_type()
-        if device_type == "mps":
+        if self.device == "mps":
             torch.mps.empty_cache()
-        elif device_type == "cuda":
+        elif self.device == "cuda":
             torch.cuda.empty_cache()
 
         for context, target in self.train_loader:
@@ -703,8 +687,8 @@ class TanaForecastTrainer:
             
             self.optimizer.zero_grad()
             
-            if self.use_amp:
-                with torch.amp.autocast(device_type=device_type, dtype=self.amp_dtype):
+            if self.device == "cuda":
+                with torch.amp.autocast(device_type="cuda", dtype=torch.float16):
                     if hasattr(self.model, 'return_router_info') and self.model.return_router_info:
                         predictions, router_probs, expert_indices = self.model(context)
                         loss = self.criterion(
@@ -760,8 +744,6 @@ class TanaForecastTrainer:
         total_loss = 0.0
         num_batches = 0
         
-        device_type = self._get_device_type()
-        
         with torch.no_grad():
             for context, target in self.test_loader:
                 context = context.to(self.device)
@@ -770,8 +752,8 @@ class TanaForecastTrainer:
                 if target.dim() == 3 and target.size(1) == 1:
                     target = target.squeeze(1)
                 
-                if self.use_amp:
-                    with torch.amp.autocast(device_type=device_type, dtype=self.amp_dtype):
+                if self.device == "cuda":
+                    with torch.amp.autocast(device_type="cuda", dtype=torch.float16):
                         if hasattr(self.model, 'return_router_info') and self.model.return_router_info:
                             predictions, router_probs, expert_indices = self.model(context)
                             loss = self.criterion(
@@ -818,15 +800,41 @@ class TanaForecastTrainer:
         if checkpoint is None:
             return
         
-        self.model.load_state_dict(checkpoint['model_state_dict'])
-        self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-        
-        self.start_epoch = checkpoint['epoch'] + 1
-        self.history = checkpoint.get('metrics', {}).get('history', self.history)
-        self.best_val_loss = checkpoint.get('metrics', {}).get('best_val_loss', float('inf'))
-        
-        logger.info(f"Resumed from epoch {self.start_epoch}, best_val_loss: {self.best_val_loss:.6f}")
+        try:
+            self.model.load_state_dict(checkpoint['model_state_dict'], strict=False)
+            self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+            
+            checkpoint_epoch = checkpoint['epoch'] + 1
+            if checkpoint_epoch >= self.num_epochs:
+                logger.info(f"Checkpoint at epoch {checkpoint_epoch} is beyond num_epochs ({self.num_epochs}). Starting fresh training.")
+                self.start_epoch = 0
+                self.best_val_loss = float('inf')
+                self.history = {
+                    'train_loss': [],
+                    'val_loss': [],
+                    'learning_rates': []
+                }
+            else:
+                self.start_epoch = checkpoint_epoch
+                self.history = checkpoint.get('metrics', {}).get('history', self.history)
+                self.best_val_loss = checkpoint.get('metrics', {}).get('best_val_loss', float('inf'))
+                logger.info(f"Resumed from epoch {self.start_epoch}, best_val_loss: {self.best_val_loss:.6f}")
+        except Exception as e:
+            logger.warning(f"Failed to load checkpoint state: {e}")
+            logger.warning("Deleting incompatible checkpoint and starting fresh")
+            try:
+                last_checkpoint = self.checkpoint_manager.run_dir / "last_model.pt"
+                if last_checkpoint.exists():
+                    last_checkpoint.unlink()
+                best_checkpoint = self.checkpoint_manager.run_dir / "best_model.pt"
+                if best_checkpoint.exists():
+                    best_checkpoint.unlink()
+                metadata_path = self.checkpoint_manager.run_dir / "metadata.json"
+                if metadata_path.exists():
+                    metadata_path.unlink()
+            except Exception as del_e:
+                logger.error(f"Failed to delete incompatible checkpoint: {del_e}")
     
     def train(self) -> Dict[str, List[float]]:
         """

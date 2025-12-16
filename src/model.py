@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
-from typing import List
+from typing import List, Literal, Optional, Union, Tuple
 
 from src.utils import Constants
 
@@ -16,6 +16,32 @@ class Monitor:
 
     def get_expert_counts(self) -> List[int]:
         return self.expert_counts
+
+class RoPE:
+    @staticmethod
+    def initialize_rope(
+        max_seq_length: int,
+        head_dim: int,
+        device: Literal["cuda", "mps", "cpu"]
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        half_dim = head_dim // 2
+        inv_freq = 1.0 / (10000 ** torch.arange(0, half_dim, device=device))
+        positions = torch.arange(max_seq_length, device=device)
+        angles = torch.einsum("i,j->ij", positions, inv_freq)
+
+        return torch.cos(angles), torch.sin(angles)
+
+    @staticmethod
+    def apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+        b, h, s, d = x.shape
+        x = x.view(b, h, s, d // 2, 2)
+        x1, x2 = x[..., 0], x[..., 1]
+        cos = cos[:s].unsqueeze(0).unsqueeze(0)
+        sin = sin[:s].unsqueeze(0).unsqueeze(0)
+        out1 = x1 * cos - x2 * sin
+        out2 = x1 * sin + x2 * cos
+        return torch.stack([out1, out2], dim=-1).reshape(b, h, s, d)
+
 
 class Patch(nn.Module):
     def __init__(
@@ -122,6 +148,68 @@ class DeepCrossNetwork(nn.Module):
         
         return output
 
+class MultiHeadLatentAttention(nn.Module):
+    def __init__(
+        self, 
+        d_model: int, 
+        latent_dim: int = None,
+        dropout: float = 0.1, 
+        num_heads: int = Constants.attention_heads
+    ) -> None:
+        super().__init__()
+        if latent_dim is None:
+            latent_dim = d_model
+        assert latent_dim % num_heads == 0, "latent_dim must be divisible by num_heads"
+
+        self.d_model = d_model
+        self.latent_dim = latent_dim
+        self.d_k = latent_dim // num_heads
+        self.num_heads = num_heads
+
+        self.q_proj = nn.Linear(in_features=d_model, out_features=latent_dim, bias=False)
+        self.k_proj = nn.Linear(in_features=d_model, out_features=latent_dim, bias=False)
+        self.v_proj = nn.Linear(in_features=d_model, out_features=latent_dim, bias=False)
+        self.out_proj = nn.Linear(in_features=latent_dim, out_features=d_model)
+        self.z_proj = nn.Linear(in_features=d_model, out_features=latent_dim, bias=False)
+
+        self.dropout = nn.Dropout(p=dropout)
+
+    def forward(
+        self, 
+        X: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        return_latents: bool = False,
+        cos: Optional[torch.Tensor] = None,
+        sin: Optional[torch.Tensor] = None,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        B, N, _ = X.shape
+
+        q = self.q_proj(X).view(B, N, self.num_heads, self.d_k).transpose(1, 2)
+        z = self.z_proj(X)
+        k = self.k_proj(X).view(B, N, self.num_heads, self.d_k).transpose(1, 2)
+        v = self.v_proj(X).view(B, N, self.num_heads, self.d_k).transpose(1, 2)
+
+        if cos is not None and sin is not None:
+            q = RoPE.apply_rope(q, cos, sin)
+            k = RoPE.apply_rope(k, cos, sin)
+
+        attention_scores = (q @ k.transpose(-2, -1)) / (self.d_k ** 0.5)
+
+        if attention_mask is not None:
+            attention_scores = attention_scores.masked_fill(attention_mask == 0, float('-inf'))
+
+        attention_probabilities = F.softmax(attention_scores, dim=-1)
+        attention_probabilities = self.dropout(attention_probabilities)
+
+        out = attention_probabilities @ v
+        out = out.transpose(1, 2).contiguous().view(B, N, self.latent_dim)
+        out = self.out_proj(out)
+
+        if return_latents:
+            return out, z
+
+        return out
+
 class MultiHeadCausalSelfAttention(nn.Module):
     def __init__(self, d_model: int, num_heads: int = Constants.attention_heads) -> None:
         super().__init__()
@@ -225,7 +313,9 @@ class Decoder(nn.Module):
         prediction_length: int,
         d_model: int = 64,
         monitor: Monitor = None,
-        return_router_info: bool = False
+        return_router_info: bool = False,
+        cos: Optional[torch.Tensor] = None,
+        sin: Optional[torch.Tensor] = None
     ) -> None:
         super().__init__()
         self.context_window = context_window
@@ -241,9 +331,12 @@ class Decoder(nn.Module):
             stride=Constants.stride,
             d_out=Constants.d_out
         )
+
+        self.cos = cos
+        self.sin = sin
         self.deep_cross = DeepCrossNetwork(d_model=Constants.d_out, n_cross_layers=3, n_deep_layers=3, deep_hidden_dim=Constants.d_out * 2, dropout=0.1)
         self.layer_norm_1 = nn.LayerNorm(Constants.d_out)
-        self.attention = MultiHeadCausalSelfAttention(d_model=Constants.d_out, num_heads=Constants.attention_heads)
+        self.attention = MultiHeadLatentAttention(d_model=Constants.d_out, num_heads=Constants.attention_heads)
         self.layer_norm_2 = nn.LayerNorm(Constants.d_out)
         self.moe = MixtureOfExpert(d_model=Constants.d_out, n_experts=Constants.n_experts, top_k=Constants.top_k, monitor=self.monitor, return_router_info=return_router_info)
         self.out = nn.Linear(in_features=Constants.d_out, out_features=prediction_length)
@@ -266,7 +359,7 @@ class Decoder(nn.Module):
         X = self.patch(X)
         X = self.deep_cross(X)
         X = self.layer_norm_1(X)
-        X = self.attention(X)
+        X = self.attention(X=X, sin=self.sin, cos=self.cos)
         
         if self.return_router_info:
             X, router_probs, expert_indices = self.moe(X)
@@ -307,82 +400,33 @@ class TanaForecast(nn.Module):
         self.prediction_length = prediction_length
         self.return_router_info = return_router_info
 
+        head_dim = Constants.d_out // Constants.attention_heads
+        num_patches = (context_window - Constants.patch_size) // Constants.stride + 1
+        cos, sin = RoPE.initialize_rope(max_seq_length=num_patches, head_dim=head_dim, device=device)
+
+        self.register_buffer('rope_cos', cos)
+        self.register_buffer('rope_sin', sin)
+
         self.decoders = nn.ModuleList([
             Decoder(
                 context_window=context_window, 
                 prediction_length=prediction_length,
                 monitor=self.monitor,
-                return_router_info=return_router_info
+                return_router_info=return_router_info,
+                cos=self.rope_cos,
+                sin=self.rope_sin
             ) for _ in range(Constants.n_decoders)
         ])
 
         self.number_of_parameters = sum(p.numel() for p in self.parameters())
         
         self.to(self.device)
-    
-    @classmethod
-    def from_pretrained(
-        cls,
-        context_window: int,
-        prediction_length: int,
-        checkpoint_path: str = None,
-        device: str = None
-    ):
-        """
-        Create a TanaForecast model and load pretrained weights.
-        
-        Args:
-            context_window: Context window size
-            prediction_length: Prediction length
-            checkpoint_path: Path to checkpoint. If None, uses default foundation_latest.pt
-            device: Device to load model on
-            
-        Returns:
-            TanaForecast model with pretrained weights
-            
-        Example:
-            model = TanaForecast.from_pretrained(1024, 256, device="mps")
-        """
-        if device is None:
-            if torch.cuda.is_available():
-                device = "cuda"
-            elif torch.backends.mps.is_available():
-                device = "mps"
-            else:
-                device = "cpu"
-        
-        model = cls(
-            context_window=context_window,
-            prediction_length=prediction_length,
-            device=device
-        )
-        model.load_foundation_weights(checkpoint_path)
-        return model
 
     def forward(self, X: torch.Tensor, prediction_length: int = 12):
-        outputs = []
-        router_probs_list = []
-        expert_indices_list = []
-        
         for decoder in self.decoders:
-            if self.return_router_info:
-                output, router_probs, expert_indices = decoder(X, prediction_length)
-                outputs.append(output)
-                router_probs_list.append(router_probs)
-                expert_indices_list.append(expert_indices)
-            else:
-                output = decoder(X, prediction_length)
-                outputs.append(output)
+            X = decoder(X, prediction_length)
         
-        stacked_outputs = torch.stack(outputs, dim=0)
-        mean_output = torch.mean(stacked_outputs, dim=0)
-        
-        if self.return_router_info:
-            stacked_router_probs = torch.stack(router_probs_list, dim=0)
-            stacked_expert_indices = torch.stack(expert_indices_list, dim=0)
-            return mean_output, stacked_router_probs, stacked_expert_indices
-        
-        return mean_output
+        return X
     
     def set_return_router_info(self, value: bool) -> None:
         """

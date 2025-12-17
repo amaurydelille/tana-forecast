@@ -11,7 +11,7 @@ We chose a default 4096 data points context window and 256 data points predictio
 The model is tested on ```fev-benchmark```.
 
 ## Citations
-```bibtext
+```bibtex
 @article{shchur2025fev,
   title={{fev-bench}: A Realistic Benchmark for Time Series Forecasting},
   author={Shchur, Oleksandr and Ansari, Abdul Fatir and Turkmen, Caner and Stella, Lorenzo and Erickson, Nick and Guerron, Pablo and Bohlke-Schneider, Michael and Wang, Yuyang},
